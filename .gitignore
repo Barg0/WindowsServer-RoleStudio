@@ -1,0 +1,38 @@
+# Exported deployment contracts may contain plain-text passwords.
+config.json
+
+# Script output
+logs/
+
+# Installers the run fetches (Windows Admin Center is ~130 MB)
+downloads/
+
+# The old scripts kept around as reference, not part of the deployment.
+old-scripts/
+
+# Installation media - gigabytes of licensed ISOs, never committed
+isos/*
+!isos/README.md
+
+# Zips somebody made to carry the deployment somewhere - never the repo's.
+*.zip
+
+# Design handoff bundles from Claude Design - reference input, not shipped source.
+.claude/design_handoff_*/
+
+# Handoff notes from Claude Design - the same rule as the bundles above. Reference
+# input that has already been applied to the studio; tracking it would present a
+# second, drifting copy of decisions the file itself is the source of truth for.
+.claude/CARDS.md
+.claude/OVERVIEW.md
+
+# Working notes for the agent that helps maintain this, and the house PowerShell rules
+# they refer to. Both describe how the repository is worked ON rather than what it does,
+# and a reader of the public repo is served by README.md instead. Tracked copies have to
+# be removed from the index once - .gitignore alone does not untrack a file that is
+# already in it.
+.claude/
+CLAUDE.md
+claude.md
+POWERSHELL_GUIDELINES.md
+Powershell_Guidelines.md
