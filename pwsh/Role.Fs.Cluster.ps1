@@ -196,13 +196,19 @@ function Test-FsClusterPrerequisite {
     }
 
     # The share groups, same rule as the single host: created by the domain controller
-    # run, never here.
+    # run, never here. A share's read-only group is checked with them - it is a group
+    # this run writes into an ACL, so its absence is the same prerequisite failure.
     $groups = Get-StudioGroupDefinition -Entries (Get-ConfigArray -InputObject $FileServer -Name "groups")
-    foreach ($group in $groups) {
+    $wanted = @($groups | ForEach-Object { $_.Name })
+    foreach ($share in (Get-FsShare -FileServer $FileServer)) {
+        if (-not [string]::IsNullOrWhiteSpace($share.ReadGroup)) { $wanted += $share.ReadGroup }
+    }
+    foreach ($groupName in ($wanted | Select-Object -Unique)) {
         $found = $null
-        try { $found = Find-AdcsGroup -Name $group.Name } catch { $found = $null }
+        try { $found = Find-AdcsGroup -Name $groupName } catch { $found = $null }
         if ($null -eq $found) {
-            Write-Log "Share group '$($group.Name)' does not exist - run this config on a domain controller first, or create it by hand" -Tag "Error"
+            Write-Log "Share group '$groupName' does not exist - run this config on a domain controller first, or create it by hand" -Tag "Error"
+            Write-Log "    New-ADGroup -Name '$groupName' -GroupScope DomainLocal -GroupCategory Security" -Tag "Error"
             $passed = $false
         }
     }
@@ -630,8 +636,9 @@ function Invoke-FsClusterConfiguration {
         # it has to mean the same thing on both nodes. Domain groups and well-known SIDs
         # do; a machine-local group does not - BUILTIN\Administrators is the same
         # S-1-5-32-544 everywhere and resolves against whichever node owns the role,
-        # which is exactly the intent.
-        if (-not (Set-FsFolderSecurity -Path $sharePath -GroupName $share.Group -AccessModel $share.AccessModel)) {
+        # which is exactly the intent. The read-only tier changes none of that - it is
+        # one more domain group in the same descriptor.
+        if (-not (Set-FsFolderSecurity -Path $sharePath -GroupName $share.Group -ReadGroupName $share.ReadGroup -AccessModel $share.AccessModel)) {
             $failures += $share.Name
             continue
         }

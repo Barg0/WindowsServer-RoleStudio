@@ -1359,6 +1359,12 @@ function Show-FsSummary {
         if ([string](Get-ConfigText -InputObject $share -Name "accessModel" -Default "standard") -eq "fslogixContainer") {
             $name += " (profile containers)"
         }
+        # A second group on a share changes who may WRITE what is in it, which the share
+        # name says nothing about - so the two-tier shares are marked here rather than
+        # left to be discovered from the group list.
+        elseif (-not [string]::IsNullOrWhiteSpace((Get-ConfigText -InputObject $share -Name "readGroup"))) {
+            $name += " (rw+ro)"
+        }
         $shareNames += $name
     }
     $shareText = "None"
@@ -1379,6 +1385,12 @@ function Show-FsSummary {
     $enumeration = "off"
     if ([bool](Get-ConfigValue -InputObject $FileServer -Name "accessBasedEnumeration" -Default $true)) { $enumeration = "on" }
     Write-FastfetchInfoRow -Label "access-based enum" -Value $enumeration -LabelWidth 24 -IndentWidth 2
+
+    $tiers = "one group per share"
+    if ([bool](Get-ConfigValue -InputObject $FileServer -Name "splitAccessGroups" -Default $false)) {
+        $tiers = "read/write and read-only groups"
+    }
+    Write-FastfetchInfoRow -Label "share access" -Value $tiers -LabelWidth 24 -IndentWidth 2
 
     $shadow = Get-ConfigValue -InputObject $FileServer -Name "shadowCopies"
     $shadowText = "off"
@@ -1410,7 +1422,8 @@ function Show-FsSummary {
     if ($fsLinks.Count -gt 0) { $fsLinkText = $fsLinks -join ", " }
     Write-FastfetchInfoRow -Label "drive-map policies" -Value $fsLinkText -LabelWidth 24 -IndentWidth 2
 
-    Write-Host "    on a domain controller this run creates the share groups and members; on the file server they are a prerequisite" -ForegroundColor DarkGray
+    Write-Host "    on a domain controller this run creates the share groups as domain local security groups, with their members;" -ForegroundColor DarkGray
+    Write-Host "    on the file server they are a prerequisite" -ForegroundColor DarkGray
 }
 
 function Show-PrintSummary {
@@ -1444,7 +1457,15 @@ function Show-PrintSummary {
     foreach ($queue in $queues) {
         $target = $queue.Group
         if ([string]::IsNullOrWhiteSpace($target)) { $target = "nobody" }
-        Write-FastfetchInfoRow -Label $queue.Name -Value ("shared as '{0}' -> {1}" -f $queue.ShareName, $target) -LabelWidth 24 -IndentWidth 4
+        # Who it is DEPLOYED to, then who may PRINT on it. They are two different
+        # questions and the queue row used to answer only the first, which reads as though
+        # the group decided both - the thing this role spent a bench day proving wrong.
+        $mayPrint = switch ([string]$queue.Rights) {
+            "authenticated" { "Authenticated Users may print" }
+            "group"         { "only that group + Domain Computers may print" }
+            default         { "Everyone may print" }
+        }
+        Write-FastfetchInfoRow -Label $queue.Name -Value ("shared as '{0}' -> {1}, {2}" -f $queue.ShareName, $target, $mayPrint) -LabelWidth 24 -IndentWidth 4
     }
 
     $groupNames = @()

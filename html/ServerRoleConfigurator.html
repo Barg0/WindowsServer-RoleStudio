@@ -4940,6 +4940,16 @@ function defaultFs() {
     /* Hides what the reader could not open anyway - on every share, and on each
        namespace that switches its own flag on. */
     accessBasedEnumeration: true,
+    /* One group per share, or two. Off is the design this role has always built - the
+       share group holds everything a working group needs and there is no second tier.
+       On splits every general-purpose share into a read/write group and a read-only one,
+       which is the AGDLP shape most file servers are actually run as: the same folder,
+       two answers to "may this person change it". It is a whole-run switch rather than a
+       per-share one because it decides what the Generate button MINTS, and a design where
+       half the shares have a read-only tier and half do not is one nobody can describe in
+       a sentence. A profile container share is never split whatever this says - a user
+       who cannot write their own container does not sign in. */
+    splitAccessGroups: false,
     /* On by default. A design that states a file system, an allocation unit and a label
        and then leaves somebody to type Format-Volume has not built anything. Every
        destructive edge belongs to Initialize-StudioDataVolume, which this shares with the
@@ -5043,7 +5053,7 @@ function createPrintVariation(label) {
 const PRINT_PERMISSION_MODES = [
   { id: "default",       label: "Leave it as Windows made it (Everyone)" },
   { id: "authenticated", label: "Authenticated Users" },
-  { id: "group",         label: "Only the printer's deployment group" }
+  { id: "group",         label: "The printer's deployment group (and Domain Computers)" }
 ];
 
 /* Absent is not a choice - it is a design written before this setting existed, and the
@@ -5069,27 +5079,31 @@ function createPrintPrinter(name) {
        whoever may print on it may print on it whichever queue they pick - so the group is
        a property of the object, not of each way it happens to be published. */
     group: "",
-    /* `authenticated`, not `group`, and this is a default that was CHANGED after the
-       bench proved the old one could not work (2026-09-05).
+    /* `group`, and this default has moved twice for one reason - the driver fetch.
 
        `group` is the tighter answer and it reads like the right one: the group the policy
        targets is the group that holds Print, so "deployed to you" and "may print" cannot
-       drift apart. What it cannot do is the FIRST connection. Connecting to a shared
+       drift apart. What it could not do was the FIRST connection. Connecting to a shared
        queue fetches the driver, and that fetch reaches the print server as the client's
-       COMPUTER account - which is in no group of people. Field-observed: a user in the
-       group, with the group in their token, refused; Print back on Everyone, works.
+       COMPUTER account - which is in no group of people. Field-observed 2026-09-05: a
+       user in the group, with the group in their token, refused; Print back on Everyone,
+       works. The default moved to `authenticated` on the strength of that.
 
        A printer ACL cannot express "machines may fetch, users may print" - both are the
-       same `PRINTER_ACCESS_USE` right - so the choice is real and it is between:
+       same `PRINTER_ACCESS_USE` right - but it CAN name the machines, and that is what
+       `group` now does: the deployment group plus **Domain Computers**, resolved by RID
+       off the domain's own SID. The fleet may fetch a driver; the people who may print
+       are still one group. That is strictly narrower than `authenticated`, which is every
+       account in the domain, and it works on a machine nobody has touched - so the reason
+       the default was not `group` has gone, and the default is `group` again.
 
-         authenticated   machines and users, no anonymous or guest. Works on a fleet
-                         that has never seen the driver, which is every new deployment.
-         group           narrowest, and needs the driver already staged on the clients.
+         group           the deployment group, plus the machines for the driver fetch.
+         authenticated   every account in the domain, no anonymous or guest. The milder
+                         answer, and the one for a fleet that is not domain-joined.
 
-       The default has to be the one that works on a machine nobody has touched. `group`
-       stays one selection away and the blade now says what it costs. Designs written
-       before this keep whatever they stated - an absent key still reads as `default`. */
-    permissions: "authenticated",
+       Designs written before any of this keep whatever they stated - an absent key still
+       reads as `default`. */
+    permissions: "group",
     /* Off: this design deploys by policy, and a published queue is only reachable by a
        search nobody runs when the printer already arrives on its own. */
     publishInDirectory: false,
@@ -5377,7 +5391,12 @@ function createFsGroup(name, members) {
    option follows, so inheriting means the same thing on the wire as it does on screen. */
 function createFsShare(name, group, accessModel) {
   return { _id: uid("fsshare"), name: String(name || ""), hidden: true,
-    group: String(group || ""), description: "", driveLetter: "", driveLabel: "",
+    group: String(group || ""),
+    /* The read-only tier, and empty is a design rather than a gap: a share can be
+       read/write only even while the general switch is on. It is only ever read on a
+       general-purpose share - a profile container share has no read-only tier, because
+       a user who cannot write their own container cannot sign in. */
+    readGroup: "", description: "", driveLetter: "", driveLabel: "",
     /* Anything but the one known profile value is the standard model. Reading an
        unrecognised string the other way would re-grade a general-purpose share to an
        ACL nobody currently listed can read what is already in it. */
@@ -9768,6 +9787,27 @@ function validateFsSection(issues, error, warn) {
       error(where, "The share '" + esc(name) + "' names the group '" + esc(share.group) + "', which is not defined above.");
     }
 
+    /* The read-only tier. Empty is a design - not every share has readers who may not
+       write - so only a name that is wrong is an error. */
+    const readGroup = String(share.readGroup || "").trim();
+    if (readGroup) {
+      if (readGroup.indexOf("\\") === -1 && groupNames.indexOf(readGroup) === -1 && !fsGroupIsRds(readGroup)) {
+        error(where, "The share '" + esc(name) + "' names the read-only group '" + esc(readGroup) + "', which is not defined above.");
+      }
+      if (readGroup.toLowerCase() === String(share.group || "").trim().toLowerCase()) {
+        error(where, "The share '" + esc(name) + "' names '" + esc(readGroup) + "' as both its read/write and its read-only group. " +
+          "One group cannot be two answers - the run would grant it both rights and the read-only half would mean nothing.");
+      }
+      /* A profile container share has no read-only tier: the ACL exists so a user can
+         create and own their own container, and a member who may not write does not sign
+         in. The studio does not offer the control, so this is a document written or
+         edited elsewhere. */
+      if (fsIsProfileShare(share)) {
+        error(where, "The profile share '" + esc(name) + "' names a read-only group. A user who cannot write their own container " +
+          "cannot sign in - clear it.");
+      }
+    }
+
     if (fsIsProfileShare(share)) {
       /* Listing is part of Modify even when it stops at the root, so without
          access-based enumeration the container root reads back as the user list. */
@@ -10568,6 +10608,11 @@ function buildFsSection(includeSecrets) {
           name: String(share.name || "").trim(),
           hidden: share.hidden !== false,
           group: String(share.group || "").trim(),
+          /* Written only where there is a second tier, and empty otherwise rather than
+             omitted: the provider reads the key and grants read-only to whatever it
+             names, so a design with the switch off has to say so in every share rather
+             than leave a stale name behind for a reader to act on. */
+          readGroup: fsShareIsSplit(share) ? String(share.readGroup || "").trim() : "",
           description: String(share.description || "").trim(),
           /* Always emitted, including "standard". A share whose permissions model is
              implied by its absence is one an older reader gets wrong in the direction
@@ -10587,6 +10632,12 @@ function buildFsSection(includeSecrets) {
       })
       .filter(function (share) { return !!share.name; }),
     accessBasedEnumeration: !!fs.accessBasedEnumeration,
+    /* Always stated. Nothing in the run branches on it - each share's own readGroup is
+       what the provider acts on - but it is what the console summary reports and what
+       reading this file back turns the switch on from, so a design that splits its
+       groups says so once rather than being inferred from a share that happens to have
+       two names on it. */
+    splitAccessGroups: !!fs.splitAccessGroups,
     prepareVolumes: !!fs.prepareVolumes,
     defenderExclusions: !!fs.defenderExclusions,
     shadowCopies: {
@@ -12780,6 +12831,11 @@ function applyFsDocument(target, source) {
     const share = createFsShare(entry.name, entry.group,
       String(entry.accessModel || "") === "fslogixContainer" ? "fslogixContainer" : "standard");
     share.hidden = entry.hidden !== false;
+    /* Read whatever the document names, whether or not splitAccessGroups says so: the
+       key is what the provider acts on, and a share carrying one is a share with a
+       read-only tier however the switch was written. The switch is turned on below from
+       the same evidence, so the field is on screen rather than silently in the file. */
+    share.readGroup = String(entry.readGroup || "");
     share.description = String(entry.description || "");
     share.driveLetter = /^[G-Z]$/.test(String(entry.driveLetter || "").trim().toUpperCase()) ? String(entry.driveLetter).trim().toUpperCase() : "";
     share.driveLabel = String(entry.driveLabel || "");
@@ -12789,6 +12845,11 @@ function applyFsDocument(target, source) {
   });
 
   target.accessBasedEnumeration = source.accessBasedEnumeration !== false;
+  /* Off by default, and on whenever the document proves it - a share naming a read-only
+     group is a split design whether or not the key was written, and reading it the other
+     way would hide a field that is already deciding who may write. */
+  target.splitAccessGroups = !!source.splitAccessGroups ||
+    target.shares.some(function (share) { return !!String(share.readGroup || "").trim(); });
   target.prepareVolumes = source.prepareVolumes !== false;
   target.defenderExclusions = source.defenderExclusions !== false;
 
@@ -13679,6 +13740,7 @@ function mergeFsState(target, source) {
   target.shares = ((source.shares || [])).map(function (entry) {
     const share = createFsShare(entry.name, entry.group, entry.accessModel);
     share.hidden = entry.hidden !== false;
+    share.readGroup = String(entry.readGroup || "");
     share.description = String(entry.description || "");
     share.driveLetter = String(entry.driveLetter || "");
     share.driveLabel = String(entry.driveLabel || "");
@@ -13686,6 +13748,10 @@ function mergeFsState(target, source) {
     if (entry.abe === "on" || entry.abe === "off") { share.abe = entry.abe; }
     return share;
   });
+  /* Read after the shares, for the same reason the config path does: a share naming a
+     read-only group is a split design whatever the key says. */
+  target.splitAccessGroups = !!source.splitAccessGroups ||
+    target.shares.some(function (share) { return !!String(share.readGroup || "").trim(); });
 
   const shadow = source.shadowCopies || {};
   target.shadowCopies.enabled = shadow.enabled !== false;
@@ -20618,14 +20684,35 @@ function fsLogixPolicyValues() {
 
   return values;
 }
+/* Whether this design splits a share's people into two groups. A profile container
+   share is never split: the ACL it gets exists so a user can create and own their own
+   container, and a read-only tier on that is a user who cannot sign in. */
+function fsSplitGroups() { return !!state.fs.splitAccessGroups; }
+function fsShareIsSplit(share) { return fsSplitGroups() && !fsIsProfileShare(share); }
+
+/* The stem both tiers hang off - "Share - Hr" from a share called hr, or from its drive
+   label when it has one. The suffixes are what a person reads off the group list, so they
+   are the short forms everybody already writes on a share: RW and RO. */
+function fsGroupStem(share) {
+  const base = String(share.driveLabel || "").trim() || String(share.name || "").trim();
+  if (!base) { return ""; }
+  return "Share - " + base.charAt(0).toUpperCase() + base.slice(1);
+}
 function fsDerivedGroupName(share) {
   /* A profile share is not named after a drive - it is named after who signs in, so
      Generate mints the first of the two groups the picker offers rather than a
      "Share - Profiles" nobody would use. */
   if (fsIsProfileShare(share)) { return fsProfileGroupName() || FSLOGIX_PROFILE_GROUPS[0]; }
-  const base = String(share.driveLabel || "").trim() || String(share.name || "").trim();
-  if (!base) { return ""; }
-  return "Share - " + base.charAt(0).toUpperCase() + base.slice(1);
+  const stem = fsGroupStem(share);
+  if (!stem) { return ""; }
+  return fsShareIsSplit(share) ? (stem + " - RW") : stem;
+}
+/* Empty on a share that has no second tier - a profile share, or a design with the
+   switch off - so every caller can ask for it without first asking whether it exists. */
+function fsDerivedReadGroupName(share) {
+  if (!fsShareIsSplit(share)) { return ""; }
+  const stem = fsGroupStem(share);
+  return stem ? (stem + " - RO") : "";
 }
 
 /* Renaming a group has to carry the shares that name it, or the rename silently
@@ -20637,6 +20724,10 @@ function fsRenameGroup(index, nextName) {
   if (!previous || previous === wanted) { return; }
   state.fs.shares.forEach(function (share) {
     if (String(share.group || "").trim() === previous) { share.group = wanted; }
+    /* The read-only tier is named the same way and orphans the same way - a rename that
+       carried only the read/write half would leave the share pointing at a group nothing
+       creates, and the run would refuse on a name that is no longer on screen anywhere. */
+    if (String(share.readGroup || "").trim() === previous) { share.readGroup = wanted; }
   });
 }
 
@@ -20920,14 +21011,24 @@ function renderFsProfileVolumeCard() {
    namespace - then the drive letters those answers act on. */
 function renderFsGeneralCard() {
   const fs = state.fs;
-  const on = [fs.accessBasedEnumeration, fs.prepareVolumes, fs.defenderExclusions, fs.dfs.enabled].filter(Boolean).length;
+  const on = [fs.accessBasedEnumeration, fs.splitAccessGroups, fs.prepareVolumes,
+    fs.defenderExclusions, fs.dfs.enabled].filter(Boolean).length;
   return cardOpen("settings.svg", "General settings", "Applied to the whole run, not to one share",
-      '<span class="pill status ' + (on ? "on" : "muted") + '">' + on + ' of 4 on</span>',
+      '<span class="pill status ' + (on ? "on" : "muted") + '">' + on + ' of 5 on</span>',
       { key: "fs-general", defaultOpen: true }) +
     toggleField({ label: "Access-based enumeration", path: "fs.accessBasedEnumeration", rerender: true,
       sub: hintPair("A reader only sees what their group may open - applied to every share.",
         "With the ACL model below that means the share group and local Administrators, nobody else. Each DFS namespace carries " +
         "its own switch for the same idea.") }) +
+    toggleField({ label: "Separate read/write and read-only groups", path: "fs.splitAccessGroups", rerender: true,
+      sub: hintPair("Every share is opened by two groups instead of one - <code>Share - HR - RW</code> may change it, " +
+        "<code>Share - HR - RO</code> may only read it.",
+        "<strong>Generate</strong> on a share mints both and selects them; both are created as <strong>domain local</strong> " +
+        "groups on the domain controller run, which is where a resource group belongs. The read-only group gets " +
+        "<em>Read &amp; execute</em> on the folder and <em>Read</em> on the share, so neither half can be widened by the other. " +
+        "Both are targeted by the drive-map policy, so a reader gets the same letter. The second group stays optional per " +
+        "share - a share that is read/write only just leaves it empty. Switching this off does not rename a group that has " +
+        "already been written down; it only stops the next one being minted as a pair.") }) +
     toggleField({ label: "Prepare the volumes", path: "fs.prepareVolumes", rerender: true,
       sub: hintPair("The run claims an uninitialised disk, partitions it and formats each volume to its own allocation unit.",
         "<strong>A volume that holds data is never reformatted</strong> over a mismatch - it is reported with the command that " +
@@ -20979,8 +21080,10 @@ function renderFsGroupsCard() {
     '<p class="hint">' + hintPair(
       'On the file server every group is a <strong>prerequisite</strong> - the run never creates one here.',
       'The run refuses to start while a group is missing. Run the same config on a <strong>domain controller</strong> and the ' +
-      'groups are created with the members listed here; or create them by hand with the printed <code>New-ADGroup</code> ' +
-      'line.') + '</p>' +
+      'groups are created there as <strong>domain local</strong> security groups, with the members listed here; or create them by ' +
+      'hand with the printed <code>New-ADGroup</code> line. Domain local is what a group naming a <em>resource</em> is for - it is ' +
+      'the scope that may hold accounts and global groups from anywhere in the forest and be written into an ACL on this server. ' +
+      'A group that already exists is adopted whatever scope it has, never re-scoped.') + '</p>' +
   cardClose();
 }
 
@@ -21017,14 +21120,23 @@ function renderFsSharesCard() {
        keeps, and the domain controller run creates it from there. */
     const groupKnown = !share.group || groupNames.indexOf(share.group) !== -1 ||
       share.group.indexOf("\\") !== -1 || fsGroupIsRds(share.group);
-    const body =
-      '<div class="grid-2">' +
+    const readGroupKnown = !share.readGroup || groupNames.indexOf(share.readGroup) !== -1 ||
+      share.readGroup.indexOf("\\") !== -1 || fsGroupIsRds(share.readGroup);
+    /* Two layouts, and which one depends on how many groups this share has. With one
+       group the pair reads across: share name, then who may open it. With two, the
+       groups are one decision in two halves and belong SIDE BY SIDE on their own row -
+       read/write left, read-only right, in that order - so the share name takes the row
+       above on its own. Splitting the pair across two rows put the read/write group
+       beside the name and left its read-only half stranded under it, which reads as two
+       unrelated questions rather than one with two answers. */
+    const namePicker =
         fieldText({ icon: "share.svg", label: "Share name", path: "fs.shares." + index + ".name", rerender: true, required: true,
           placeholder: "Data", spellcheck: false,
           invalid: !String(share.name || "").trim(),
-          hint: smbName ? "Published as <code>\\\\&lt;server&gt;\\" + esc(smbName) + "</code>, folder <code>" + esc(fsRootPath()) + "\\" + esc(String(share.name || "").trim()) + "</code>." : "" }) +
-        /* The select and the Generate button share the control row, so the cell keeps
-           its subgrid rows and stays level with the share name beside it. */
+          hint: smbName ? "Published as <code>\\\\&lt;server&gt;\\" + esc(smbName) + "</code>, folder <code>" + esc(fsRootPath()) + "\\" + esc(String(share.name || "").trim()) + "</code>." : "" });
+    /* The select and the Generate button share the control row, so the cell keeps
+       its subgrid rows and stays level with whatever is beside it. */
+    const groupPicker =
         (function () {
           const profile = fsIsProfileShare(share);
           const derived = fsDerivedGroupName(share);
@@ -21041,8 +21153,12 @@ function renderFsSharesCard() {
           const listed = offered.some(function (choice) { return String(choice.id) === String(share.group || ""); });
           const choices = offered.concat(share.group && !listed
             ? [{ id: share.group, label: share.group + " (missing)" }] : []);
+          /* The label says which half of the pair this is only when there IS a pair -
+             "Read/write group" on a design with one group per share names a distinction
+             the design does not make. */
           return '<label class="field">' +
-            '<span class="lbl"><span class="lbl-icon">' + icon("group.svg", 14) + '</span>Share group</span>' +
+            '<span class="lbl"><span class="lbl-icon">' + icon("group.svg", 14) + '</span>' +
+              (fsShareIsSplit(share) ? "Read/write group" : "Share group") + '</span>' +
             '<span class="field-inline">' +
               '<select data-path="fs.shares.' + index + '.group" data-rerender="1">' +
                 choices.map(function (choice) {
@@ -21060,15 +21176,52 @@ function renderFsSharesCard() {
                   "<code>AVD - Users</code> for Azure Virtual Desktop ones. Picking either creates it in <strong>Share groups</strong> " +
                   "below; a group the Remote Desktop blade already keeps is created by that blade's own run instead."
                 : (derived
-                    ? "Pick <code>" + esc(derived) + " (create)</code> above, or press Generate - either one creates the group in " +
-                      "<strong>Share groups</strong> below and selects it. The name comes from the drive label, or the share name when " +
+                    ? "Pick <code>" + esc(derived) + " (create)</code> above, or press Generate - either one creates " +
+                      (fsShareIsSplit(share) ? "both tiers" : "the group") + " in <strong>Share groups</strong> below and selects " +
+                      (fsShareIsSplit(share) ? "them" : "it") + ". The name comes from the drive label, or the share name when " +
                       "there is none."
                     : "Name the share first and Generate mints a group from it.")) +
             '</span>' +
           '</label>';
-        }()) +
-      '</div>' +
+        }());
+    /* The second tier, and only where there is one: the general switch on, and not a
+       profile container share. Empty is a valid answer - a share nobody reads without
+       also being able to write it just leaves it unset. */
+    const readPicker = !fsShareIsSplit(share) ? "" :
+            (function () {
+              const derivedRo = fsDerivedReadGroupName(share);
+              const offered = [{ id: "", label: "- none, read/write only -" }].concat(
+                groupNames.map(function (name) { return { id: name, label: name }; }))
+                .concat(derivedRo && groupNames.indexOf(derivedRo) === -1
+                  ? [{ id: derivedRo, label: derivedRo + " (create)" }] : []);
+              const listed = offered.some(function (choice) { return String(choice.id) === String(share.readGroup || ""); });
+              const choices = offered.concat(share.readGroup && !listed
+                ? [{ id: share.readGroup, label: share.readGroup + " (missing)" }] : []);
+              return '<label class="field">' +
+                '<span class="lbl"><span class="lbl-icon">' + icon("group.svg", 14) + '</span>Read-only group</span>' +
+                '<select data-path="fs.shares.' + index + '.readGroup" data-rerender="1">' +
+                  choices.map(function (choice) {
+                    return '<option value="' + esc(choice.id) + '"' +
+                      (String(choice.id) === String(share.readGroup || "") ? " selected" : "") + '>' + esc(choice.label) + '</option>';
+                  }).join("") +
+                '</select>' +
+                '<span class="hint">' +
+                  (String(share.readGroup || "").trim()
+                    ? "<em>Read &amp; execute</em> on the folder, <em>Read</em> on the share - it can open and copy what is in here " +
+                      "and change none of it."
+                    : "None yet, so this share is read/write only. Generate beside the group above mints <code>" +
+                      esc(derivedRo || "the pair") + "</code> along with it.") +
+                '</span>' +
+              '</label>';
+            }());
+
+    const body =
+      (readPicker
+        ? '<div class="grid-2">' + namePicker + '<div></div>' + '</div>' +
+          '<div class="grid-2">' + groupPicker + readPicker + '</div>'
+        : '<div class="grid-2">' + namePicker + groupPicker + '</div>') +
       (groupKnown ? "" : warnBox("The group <code>" + esc(share.group) + "</code> is not in the list above.")) +
+      (readGroupKnown ? "" : warnBox("The read-only group <code>" + esc(share.readGroup) + "</code> is not in the list above.")) +
       fieldText({ icon: "info.svg", label: "Description", path: "fs.shares." + index + ".description",
         placeholder: "Team data", hint: "Shows in <code>net view</code> and Explorer's details - optional." }) +
       toggleField({ label: "Hidden share ($)", path: "fs.shares." + index + ".hidden", rerender: true,
@@ -21111,9 +21264,18 @@ function renderFsSharesCard() {
               factRow({ icon: "gpo.svg", name: "GPO (created on the DC run)", value: fsDriveMapGpoName(share),
                 why: "A user GPO - computer settings disabled. Where it is linked is set once for all of them, on <strong>Drive-map policies</strong> below." }),
               factRow({ icon: "disk.svg", name: "Maps", value: share.driveLetter + ": -> " + fsSharePathFor(share),
-                why: "Drive map preference, action Update, reconnect on, labelled '" + fsDriveLabelFor(share) + "', item-level targeted to " + (share.group || "the share group") + "." }),
-              factRow({ icon: "restore-points.svg", name: "And cleans up after itself", value: "Delete " + share.driveLetter + ": when not in " + (share.group || "the share group"),
-                why: "A second entry in the same GPO, targeted at NOT being a member - losing the group unmounts the drive at the next refresh, no stale letters." })
+                why: "Drive map preference, action Update, reconnect on, labelled '" + fsDriveLabelFor(share) + "', item-level targeted to " +
+                  (String(share.readGroup || "").trim()
+                    ? esc(share.group || "the share group") + " <strong>or</strong> " + esc(share.readGroup) + " - a reader gets the same letter, " +
+                      "and what they can do once it is open is the folder's decision, not the drive's."
+                    : (share.group || "the share group") + ".") }),
+              factRow({ icon: "restore-points.svg", name: "And cleans up after itself",
+                value: "Delete " + share.driveLetter + ": " + (String(share.readGroup || "").trim()
+                  ? "when in neither group"
+                  : "when not in " + (share.group || "the share group")),
+                why: "A second entry in the same GPO, targeted at NOT being a member" +
+                  (String(share.readGroup || "").trim() ? " of either" : "") +
+                  " - losing the group unmounts the drive at the next refresh, no stale letters." })
             ]), "gpo.svg")
         : "") +
       (fsIsProfileShare(share)
@@ -21144,10 +21306,22 @@ function renderFsSharesCard() {
                 why: "The server's own management and backup path." }),
               factRow({ icon: "groups.svg", name: (share.group || "Share group"), value: "All advanced permissions except Change permissions + Take ownership",
                 why: "This folder, subfolders and files - read, write, create, delete, delete subfolders. Everything a working group needs, " +
-                  "nothing that lets a member rewrite who has access or take the folder over." }),
-              factRow({ icon: "share.svg", name: "Share permissions", value: (share.group || "group") + " + Administrators, Full",
-                why: "Coarse on purpose - NTFS above is the real decision, the long-standing Microsoft guidance." })
-            ]), "security.svg")) +
+                  "nothing that lets a member rewrite who has access or take the folder over." })
+            ].concat(String(share.readGroup || "").trim()
+              /* factRow escapes name and value - the raw ampersand is what reaches the
+                 page. Only `why` takes markup. */
+              ? [factRow({ icon: "groups.svg", name: share.readGroup, value: "Read & execute",
+                  why: "This folder, subfolders and files - open, list, run, copy out. No write, no create, no delete, so a reader " +
+                    "cannot change what is here even by accident. A person in both groups gets the union, which is the read/write " +
+                    "answer: put somebody in one or the other, never both." })]
+              : []).concat([
+              factRow({ icon: "share.svg", name: "Share permissions",
+                value: (share.group || "group") + " + Administrators, Full" +
+                  (String(share.readGroup || "").trim() ? "; " + share.readGroup + ", Read" : ""),
+                why: "Coarse on purpose - NTFS above is the real decision, the long-standing Microsoft guidance. The read-only group is " +
+                  "granted Read rather than Full anyway: the effective right is the same either way, and a share whose permission tab " +
+                  "says Full for a group that cannot write is a tab nobody believes twice." })
+            ])), "security.svg")) +
 
       /* What this run does not do, said on the card rather than discovered afterwards:
          the container settings are Group Policy's, and the two file-level habits that
@@ -22480,30 +22654,34 @@ function renderPrintPrintersCard() {
       fieldSelect({ label: "Who may print", path: "print.printers." + index + ".permissions", rerender: true,
         choices: PRINT_PERMISSION_MODES,
         hint: "The group above decides who the policy <em>installs</em> this printer for. This decides who may <em>use</em> it - two different " +
-          "questions, and Windows answers the second with <strong>Everyone</strong> until something says otherwise." }) +
+          "questions, and Windows answers the second with <strong>Everyone</strong> until something says otherwise. The group option carries " +
+          "<strong>Domain Computers</strong> with it, which is what lets a client that has never had the driver fetch one." }) +
 
       (printPermissionMode(printer.permissions) === "default"
         ? infoBox("Every queue of this printer keeps the descriptor Windows gave it, where <strong>Everyone</strong> holds Print. Anybody who " +
             "types <code>\\" + esc(printServerName() || "prt-01") + "\&lt;share&gt;</code> can print on it whether the policy deployed it to them or not.")
         : "") +
       (printPermissionMode(printer.permissions) === "group"
-        ? infoBox("Print goes to <code>" + esc(String(printer.group || "").trim() || "the deployment group") + "</code> and comes off Everyone. " +
-            "Somebody outside the group is refused when they <strong>connect</strong>, not when they print - installing the driver needs the Print " +
-            "right, so the symptom is <em>Access is denied</em> while adding the printer. <code>CREATOR OWNER</code> (cancelling your own job), " +
-            "<code>ALL APPLICATION PACKAGES</code> (Edge and Store apps printing at all) and the administrator entries are left exactly as they were." +
-            "<br><br><strong>It cannot serve a client that does not have the driver yet, which is why it is no longer the default.</strong> " +
-            "Connecting to a shared queue fetches the driver, and that fetch reaches this server as the client's <strong>computer account</strong> - " +
-            "which is in no group of people. Field-proven: a user in the group, with the group in their token, refused; Print back on Everyone, " +
-            "works. A printer ACL cannot say <em>machines may fetch, users may print</em> - both are the same right - so pick this only when the " +
-            "driver is already on the clients. Otherwise <strong>Authenticated Users</strong> below, which covers the machines and still keeps " +
-            "anonymous out.")
+        ? infoBox("Print goes to <code>" + esc(String(printer.group || "").trim() || "the deployment group") + "</code> and to " +
+            "<strong>Domain Computers</strong>, and comes off Everyone. Somebody outside the group is refused when they <strong>connect</strong>, " +
+            "not when they print - installing the driver needs the Print right, so the symptom is <em>Access is denied</em> while adding the " +
+            "printer. <code>CREATOR OWNER</code> (cancelling your own job), <code>ALL APPLICATION PACKAGES</code> (Edge and Store apps printing at " +
+            "all) and the administrator entries are left exactly as they were." +
+            "<br><br><strong>Domain Computers is in there for the driver fetch, and nothing else.</strong> Connecting to a shared queue fetches " +
+            "the driver, and that fetch reaches this server as the client's <strong>computer account</strong> - which is in no group of people. " +
+            "Field-proven: a user in the group, with the group in their token, refused on a machine that had never had the driver. A printer ACL " +
+            "cannot say <em>machines may fetch, users may print</em> - both are the same right - so the machines are named instead. The people who " +
+            "may print are still one group, which is narrower than Authenticated Users. It is resolved by <strong>SID</strong> (the domain's own " +
+            "SID plus RID 515), never by the name, because that name is written in whatever language the forest was built in." +
+            "<br><br>Domain controllers are <em>not</em> members of Domain Computers (they are RID 516). That only matters where a DC is itself " +
+            "a print client, and one that needs its driver staged by hand.")
         : "") +
       (printPermissionMode(printer.permissions) === "authenticated"
         ? infoBox("Print goes to <strong>Authenticated Users</strong> - everybody with an account in the domain, and no anonymous or guest session. " +
-            "The milder of the two: it does not narrow printing to the people this printer is deployed to. It does include <strong>computer " +
-            "accounts</strong>, and that is why it is the default - a client's first connection fetches the driver as its own machine account, " +
-            "which no group of people contains. The policy below is still what decides who the printer is <em>given</em> to; this only decides " +
-            "who is refused if they go looking for it by name.")
+            "The milder answer: it does not narrow printing to the people this printer is deployed to. It includes <strong>computer accounts</strong>, " +
+            "so a client's first connection can fetch the driver as its own machine account. Pick it over the group above where the printing " +
+            "machines are not all domain-joined, or where the whole domain is meant to be able to print on this queue. The policy below is still " +
+            "what decides who the printer is <em>given</em> to; this only decides who is refused if they go looking for it by name.")
         : "") +
       toggleField({ label: "Publish in the directory", path: "print.printers." + index + ".publishInDirectory", rerender: true,
         sub: "Off by default, and usually right. It writes a <code>printQueue</code> object into AD so the queue turns up in <em>Find printers</em> - a search " +
@@ -29168,8 +29346,10 @@ function handleFieldChange(event) {
      pointing at something nothing writes. That is what the "(create)" option in the
      picker does, and it is the same thing the Generate button beside it does - one rule
      covering both, so a group can never be selected and missing at the same time. A name
-     the Remote Desktop blade owns is left alone: that design creates it on its own run. */
-  const shareGroup = /^fs\.shares\.\d+\.group$/.exec(String(element.dataset.path || ""));
+     the Remote Desktop blade owns is left alone: that design creates it on its own run.
+     The read-only tier is the same field with a different name on it and follows the
+     same rule - a share must never point at a group nothing writes, whichever half. */
+  const shareGroup = /^fs\.shares\.\d+\.(group|readGroup)$/.exec(String(element.dataset.path || ""));
   if (shareGroup) {
     const wanted = String(value || "").trim();
     if (wanted && wanted.indexOf("\\") === -1 && fsGroupNameList().indexOf(wanted) === -1 && !fsGroupIsRds(wanted)) {
@@ -29588,6 +29768,16 @@ function wireMain() {
            run reads it. */
         if (fsGroupNameList().indexOf(name) === -1) { state.fs.groups.push(createFsGroup(name)); }
         share.group = name;
+        /* Both tiers in one press, because they are one decision: a share designed with
+           a read/write group and no reader is a design somebody has to come back to, and
+           the pair is what the switch above promised. Empty on a design that does not
+           split, and the read-only half is left alone once it has been answered - a
+           second press must not overwrite a group somebody picked by hand. */
+        const readName = fsDerivedReadGroupName(share);
+        if (readName && !String(share.readGroup || "").trim()) {
+          if (fsGroupNameList().indexOf(readName) === -1) { state.fs.groups.push(createFsGroup(readName)); }
+          share.readGroup = readName;
+        }
       }
       render();
       return;

@@ -82,10 +82,17 @@ function Sync-StudioAccessGroup {
     param(
         [Parameter(Mandatory)][string]$Name,
         [string]$Description = "",
-        [string[]]$MemberUpn = @()
+        [string[]]$MemberUpn = @(),
+        # Global by default, because that is what every caller but one wants: a group
+        # naming *people* - the Remote Desktop users, the NDES service account - is a
+        # global group, and nesting one into a resource group later is how AGDLP is
+        # meant to go. A group naming a *resource* on one server asks for DomainLocal
+        # instead. Only ever applied to a group this run creates; an existing group's
+        # scope is left exactly as somebody set it.
+        [ValidateSet("Global", "DomainLocal", "Universal")][string]$Scope = "Global"
     )
 
-    $null = New-AdcsAccessGroup -Name $Name -Description $Description
+    $null = New-AdcsAccessGroup -Name $Name -Description $Description -Scope $Scope
 
     $entry = Find-AdcsGroup -Name $Name
     if ($null -eq $entry) {
@@ -307,6 +314,52 @@ function Get-StudioGroupSid {
     catch {
         Write-Log "Could not read the SID of '$Name': $($_.Exception.Message)" -Tag "Debug"
         return ""
+    }
+}
+
+# ---------------------------[ The account domain's own SID ]---------------------------
+# Every group AD creates with a domain is the domain's SID plus a fixed RID - Domain
+# Computers is 515, Domain Users 513, Domain Admins 512 - so the domain SID is the one
+# value needed to name any of them without ever typing the name.
+#
+# **Their names are not reliable and their RIDs are.** `Domain Computers` is
+# `Domänencomputer` on a German domain and `Ordinateurs du domaine` on a French one: the
+# names are written in the language the forest was created in and they stay that way
+# forever. That is the same rule the well-known-account lookup above already follows for
+# the BUILTIN principals, applied one level down - BUILTIN\Administrators is a constant
+# SID everywhere, while a *domain* group's SID is constant only relative to its domain.
+#
+# The domain object itself carries the SID, so one read answers it. Empty when this
+# machine cannot reach a domain at all, which is a workgroup server and a caller's
+# problem to report rather than this function's to guess at.
+function Get-StudioAccountDomainSid {
+    try {
+        $context = Get-AdcsDefaultNamingContext
+        if ([string]::IsNullOrWhiteSpace($context)) { return $null }
+        $domain = Get-AdcsDirectoryEntry -DistinguishedName $context
+        $bytes = [byte[]]$domain.Properties["objectSid"].Value
+        return (New-Object System.Security.Principal.SecurityIdentifier($bytes, 0))
+    }
+    catch {
+        Write-Log "Could not read the domain's own SID: $($_.Exception.Message)" -Tag "Debug"
+        return $null
+    }
+}
+
+# One of those domain groups, by the RID .NET already has a name for. `AccountComputersSid`
+# is 515 - Domain Computers - and the second argument is what makes the result this
+# domain's copy of it rather than a constant.
+function Get-StudioDomainGroupSid {
+    param([Parameter(Mandatory)][System.Security.Principal.WellKnownSidType]$WellKnown)
+
+    $domainSid = Get-StudioAccountDomainSid
+    if ($null -eq $domainSid) { return $null }
+    try {
+        return (New-Object System.Security.Principal.SecurityIdentifier($WellKnown, $domainSid))
+    }
+    catch {
+        Write-Log "Could not build the '$WellKnown' SID from the domain SID: $($_.Exception.Message)" -Tag "Debug"
+        return $null
     }
 }
 

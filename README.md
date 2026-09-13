@@ -71,7 +71,7 @@ card lays out:
 | **DNS Server** | Forwarders, zones, reverse zones, scavenging |
 | **Certificate Services** | A two-tier PKI — offline root, issuing CA, templates, role groups, publication, hardening |
 | **Intune Certificate Connector** | The SCEP/NDES side of it, either alongside the PKI or bolted onto one you already have |
-| **File Server** | Shares with tight ACLs, DFS namespaces, shadow copies and the drive-map policies |
+| **File Server** | Shares with tight ACLs — one access group each, or a read/write and a read-only one — DFS namespaces, shadow copies and the drive-map policies |
 | **Print Server** | Drivers, TCP/IP ports, queues, and the policies that push them out to people |
 | **DHCP Server** | Scopes, options, DNS registration — or joining an existing server as its failover partner |
 | **Remote Desktop Services** | A quick session deployment or a full farm, with FSLogix, licensing and certificates |

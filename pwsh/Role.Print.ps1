@@ -340,7 +340,24 @@ function Set-PrintQueueObject {
 # AppContainer app prints - Edge, Store apps, several PDF readers - while Notepad is fine),
 # `CREATOR OWNER` (without it nobody can cancel their own job), SYSTEM, the administrator
 # groups. So the live descriptor is read, the printer-level Everyone entry is taken out of
-# it, the wanted one is put in, and everything else is left exactly as it was found.
+# it, the wanted ones are put in, and everything else is left exactly as it was found.
+#
+# **`group` mode grants TWO trustees, and the second one is the whole reason the mode is
+# usable.** Connecting to a shared queue fetches the driver, and that fetch reaches this
+# server as the client's COMPUTER account - which is in no group of people, so a user who
+# is in the group and has it in their token is still refused on a machine that has never
+# had the driver (field-proven 2026-09-05). A printer ACL cannot say "machines may fetch,
+# users may print": both are the same PRINTER_ACCESS_USE right. So the machines are named
+# directly - **Domain Computers** beside the deployment group - and the mode becomes what
+# it always read like: the people who may print are the group, and the machines they sit
+# at may fetch a driver. That is strictly narrower than Authenticated Users, which is
+# every account in the domain rather than one group of them plus the fleet.
+#
+# Domain Computers is a DOMAIN group, not a well-known constant, so it is resolved as the
+# domain's SID plus RID 515 (`Get-StudioDomainGroupSid`) and never by name: it is
+# `Domaenencomputer` on a German domain. Domain controllers are NOT in it - they are RID
+# 516 - which matters only where a DC is itself a print client, and one that is stages its
+# drivers by hand.
 $script:printEveryoneSid = "S-1-1-0"
 # ADS_RIGHT_DS_SELF (0x8, PRINTER_ACCESS_USE) + READ_CONTROL (0x20000) - `SWRC` in SDDL,
 # which is the mask the default descriptor gives Everyone. The same right, a different
@@ -353,14 +370,25 @@ $script:printAccessUseMask = 0x20008
 function Set-PrintSddlPrintRight {
     param(
         [Parameter(Mandatory)][string]$Sddl,
-        [Parameter(Mandatory)][string]$Sid
+        # One or more. `group` mode passes two - the deployment group and Domain Computers
+        # - and they are one grant in two halves rather than two decisions, which is why
+        # this takes a list instead of being called twice: called twice, the second pass
+        # would read a descriptor the first had already changed.
+        [Parameter(Mandatory)][string[]]$Sid
     )
 
     $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($Sddl)
     $everyone = New-Object System.Security.Principal.SecurityIdentifier($script:printEveryoneSid)
-    $wanted = New-Object System.Security.Principal.SecurityIdentifier($Sid)
+    # Deduplicated before anything is inserted: `$held` is read once, before the inserts,
+    # so the same SID arriving twice would be added twice - two identical ACEs on the
+    # printer that no run afterwards can tell apart from one.
+    $wanted = @($Sid |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique |
+        ForEach-Object { New-Object System.Security.Principal.SecurityIdentifier($_) })
+    if ($wanted.Count -eq 0) { throw "No trustee was given the print right" }
 
-    $held = $false
+    $held = @{}
     for ($index = $descriptor.DiscretionaryAcl.Count - 1; $index -ge 0; $index--) {
         $ace = $descriptor.DiscretionaryAcl[$index]
         if ($ace.AceFlags -ne [System.Security.AccessControl.AceFlags]::None) { continue }
@@ -368,14 +396,20 @@ function Set-PrintSddlPrintRight {
             $null = $descriptor.DiscretionaryAcl.RemoveAce($index)
             continue
         }
-        if (($ace.SecurityIdentifier -eq $wanted) -and ([int]$ace.AccessMask -band $script:printAccessUseMask)) { $held = $true }
+        if (-not ([int]$ace.AccessMask -band $script:printAccessUseMask)) { continue }
+        foreach ($trustee in $wanted) {
+            if ($ace.SecurityIdentifier -eq $trustee) { $held[$trustee.Value] = $true }
+        }
     }
 
-    if (-not $held) {
+    # In the order they were given, so the log below and the Security tab read the same
+    # way round: the group that means something first, the fleet behind it.
+    foreach ($trustee in $wanted) {
+        if ($held.ContainsKey($trustee.Value)) { continue }
         $ace = New-Object System.Security.AccessControl.CommonAce(
             [System.Security.AccessControl.AceFlags]::None,
             [System.Security.AccessControl.AceQualifier]::AccessAllowed,
-            $script:printAccessUseMask, $wanted, $false, $null)
+            $script:printAccessUseMask, $trustee, $false, $null)
         $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $ace)
     }
 
@@ -447,13 +481,13 @@ function Set-PrintQueuePermission {
     $mode = [string]$Queue.Rights
     if ([string]::IsNullOrWhiteSpace($mode) -or ($mode -eq "default")) { return $true }
 
-    $sid = ""
+    $sids = @()
     $label = ""
     switch ($mode) {
         "authenticated" {
             # The article's own alternative: everybody with an account in the domain, which
             # is every printing user and no anonymous or guest session.
-            $sid = "S-1-5-11"
+            $sids = @("S-1-5-11")
             $label = "Authenticated Users"
         }
         "group" {
@@ -462,11 +496,31 @@ function Set-PrintQueuePermission {
                 return $true
             }
             $label = [string]$Queue.Group
-            $sid = Get-StudioGroupSid -Name $label
-            if ([string]::IsNullOrWhiteSpace($sid)) {
+            $groupSid = Get-StudioGroupSid -Name $label
+            if ([string]::IsNullOrWhiteSpace($groupSid)) {
                 Write-Log "'$label' does not resolve from here - '$($Queue.Name)' keeps the permissions it has" -Tag "Warn"
                 Write-Log "    Run this config on a domain controller first, then re-run here" -Tag "Warn"
                 return $true
+            }
+            $sids = @($groupSid)
+
+            # The machines, beside the people. Resolved as RID 515 off this domain's own
+            # SID rather than by the name 'Domain Computers', which is written in whatever
+            # language the forest was created in. Without this ACE a client that has never
+            # had the driver is refused on its FIRST connect - the fetch arrives as the
+            # computer account - and the symptom is 'Access is denied' while ADDING the
+            # printer, which reads as a broken share rather than a permission.
+            $computersSid = Get-StudioDomainGroupSid -WellKnown ([System.Security.Principal.WellKnownSidType]::AccountComputersSid)
+            if ($null -eq $computersSid) {
+                # Not fatal, and not a reason to leave Everyone holding Print: the group
+                # ACE alone is still the design, it just cannot serve a client with no
+                # driver yet. Said loudly, with the line that finishes the job.
+                Write-Log "Domain Computers did not resolve - '$($Queue.Name)' gets '$label' only, and a client with no driver yet is refused on its first connect" -Tag "Warn"
+                Write-Log "    Add it by hand once the domain is reachable, or set this printer's permissions to 'authenticated'" -Tag "Warn"
+            }
+            else {
+                $sids += $computersSid.Value
+                $label = "$label + Domain Computers"
             }
         }
         default {
@@ -484,7 +538,7 @@ function Set-PrintQueuePermission {
     }
 
     $updated = ""
-    try { $updated = Set-PrintSddlPrintRight -Sddl $current -Sid $sid }
+    try { $updated = Set-PrintSddlPrintRight -Sddl $current -Sid $sids }
     catch {
         Write-Log "The descriptor of '$($Queue.Name)' could not be rewritten: $($_.Exception.Message)" -Tag "Warn"
         return $true
@@ -507,20 +561,21 @@ function Set-PrintQueuePermission {
         # failure from the point-and-print one (0x80070bcb) that belongs to the client
         # hardening toolbox - the codes are how you tell them apart.
         # Only for `group`. These describe what narrowing to a group of PEOPLE costs, and
-        # `authenticated` already includes the machine accounts - warning about the driver
-        # fetch there is telling somebody to do the thing they have just done. The first
-        # version of this fired in both modes and said exactly that on a clean run.
+        # `authenticated` already includes the machine accounts - saying it there is
+        # telling somebody about a limit their own choice does not have.
         if ($mode -eq "group") {
             Write-Log "    Anybody not in it is refused when they connect, which is where the driver install happens" -Tag "Debug"
             Write-Log "    A refused user shows as event 4098 '0x80070005' on their machine - group membership, not point and print" -Tag "Debug"
-            # The one this catches out. Connecting fetches the driver, and that fetch
-            # arrives as the CLIENT'S COMPUTER ACCOUNT, which is in no group of people -
-            # so a user who is in the group and has it in their token is still refused on
-            # a machine that has never had the driver. Field-proven 2026-09-05. Nothing
-            # here can fix it: a printer ACL cannot say "machines may fetch, users may
-            # print", because both are the same PRINTER_ACCESS_USE right.
-            Write-Log "    A client with no driver yet fetches it as its COMPUTER account - not in this group, so its first connect is refused" -Tag "Warn"
-            Write-Log "    Stage the driver on the clients, or use permissions 'authenticated', which covers the machines too" -Tag "Warn"
+            # The driver fetch, which used to be the warning here and is now the second
+            # ACE. Said at Debug rather than Warn because it is what the run DID, not
+            # something left for somebody: the machines hold PRINTER_ACCESS_USE so a
+            # client with no driver can fetch one, and the people who may print are still
+            # only the group.
+            Write-Log "    Domain Computers holds it too, so a client with no driver yet can still fetch one - the fetch is its computer account, not the user's" -Tag "Debug"
+            # The one case the second ACE does not cover, and it is a real one on a
+            # domain controller acting as a print client: DCs are RID 516 and are not
+            # members of Domain Computers.
+            Write-Log "    Domain controllers are not in Domain Computers - a DC printing here needs its driver staged, or an ACE of its own" -Tag "Debug"
         }
         return $true
     }

@@ -1765,8 +1765,9 @@ $script:adcsBuiltInTemplateNames = @(
 
 # groupType, as AD stores it. Security groups are the negative half of the range -
 # 0x80000000 is the security bit, and the low bits are the scope.
-$script:adcsGroupTypeGlobal    = -2147483646   # 0x80000002
-$script:adcsGroupTypeUniversal = -2147483640   # 0x80000008
+$script:adcsGroupTypeGlobal      = -2147483646   # 0x80000002
+$script:adcsGroupTypeDomainLocal = -2147483644   # 0x80000004
+$script:adcsGroupTypeUniversal   = -2147483640   # 0x80000008
 
 # name -> SID, filled in as groups are created or found. A group created seconds ago
 # may not have reached the DC that an NTAccount translation happens to ask, so the
@@ -1845,7 +1846,7 @@ function New-AdcsAccessGroup {
         [Parameter(Mandatory)][string]$Name,
         [string]$Description = "",
         [string]$ContainerDn = "",
-        [string]$Scope = "Global",
+        [ValidateSet("Global", "DomainLocal", "Universal")][string]$Scope = "Global",
         # Applied only when this run is the one creating the group. An existing group's
         # membership is somebody's decision and is never touched.
         [string[]]$InitialMemberDn = @()
@@ -1874,8 +1875,13 @@ function New-AdcsAccessGroup {
         $container = "CN=Users," + (Get-AdcsDefaultNamingContext)
     }
 
+    # Applied only to a group this run creates. An existing one returned above with its
+    # scope untouched: re-scoping a group that is already in ACLs and already has members
+    # is a change somebody made a decision about, and AD refuses half of those conversions
+    # anyway (a domain local group holding domain local members cannot become global).
     $groupType = $script:adcsGroupTypeGlobal
     if ($Scope -eq "Universal") { $groupType = $script:adcsGroupTypeUniversal }
+    elseif ($Scope -eq "DomainLocal") { $groupType = $script:adcsGroupTypeDomainLocal }
 
     try {
         $parent = Get-AdcsDirectoryEntry -DistinguishedName $container

@@ -23,11 +23,28 @@
 #     rewrite who has access.
 # Share-level permissions carry the group and local Administrators at Full and rely
 # on NTFS for the real decision, which is the long-standing Microsoft guidance.
+#
+# A share may name a SECOND group - `readGroup` - and that one gets Read & execute on
+# the folder and Read on the share. It is the only thing about the model a design
+# decides, and it is additive: a share with no readGroup is byte-for-byte the ACL this
+# role has always written, which is why the read-only tier is a second rule added to the
+# descriptor rather than a second model beside `standard` and `fslogixContainer`. A
+# profile container share never has one - a user who cannot write their own container
+# cannot sign in - and the studio refuses that design rather than writing it.
 
 $script:fsShareGroupRights = [System.Security.AccessControl.FileSystemRights](
     [System.Security.AccessControl.FileSystemRights]::FullControl -bxor
     [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bxor
     [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+
+# The read-only tier. ReadAndExecute already carries Read, ReadData, ReadAttributes,
+# ReadExtendedAttributes, ReadPermissions and Traverse; Synchronize is added because
+# every right this API grants through a handle needs it and the .NET FileSystemRights
+# enum does not fold it in the way the Explorer dialog does - without it a reader can
+# list a folder and cannot open a file in it.
+$script:fsReadGroupRights = [System.Security.AccessControl.FileSystemRights](
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+    [System.Security.AccessControl.FileSystemRights]::Synchronize)
 
 # What the task used to be called before it adopted the console's own convention -
 # removed on sight so a server that has been through both is not snapshotting twice.
@@ -381,10 +398,21 @@ function Get-FsShare {
             $shareAbe = [bool](Get-ConfigValue -InputObject $entry -Name "accessBasedEnumeration" -Default $true)
         }
 
+        # The read-only tier, empty when the design has none. Never read on a profile
+        # container share: the studio refuses to write one there, and acting on a value
+        # that reached the file some other way would grant read-only rights on a folder
+        # whose whole ACL exists so each user can write their own container.
+        $readGroup = Get-ConfigText -InputObject $entry -Name "readGroup"
+        if ($model -eq "fslogixContainer" -and -not [string]::IsNullOrWhiteSpace($readGroup)) {
+            Write-Log "'$name' is a profile share and names the read-only group '$readGroup' - ignored, a container share has no read-only tier" -Tag "Warn"
+            $readGroup = ""
+        }
+
         $shares += [pscustomobject]@{
             Name        = $name
             Hidden      = [bool](Get-ConfigValue -InputObject $entry -Name "hidden" -Default $true)
             Group       = Get-ConfigText -InputObject $entry -Name "group"
+            ReadGroup   = $readGroup
             Description = Get-ConfigText -InputObject $entry -Name "description"
             AccessModel = $model
             Abe         = $shareAbe
@@ -518,6 +546,9 @@ function Set-FsFolderSecurity {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$GroupName,
+        # The read-only tier, or empty for the single-group design. Only meaningful on
+        # the standard model - see the part header.
+        [string]$ReadGroupName = "",
         [ValidateSet("standard", "fslogixContainer")][string]$AccessModel = "standard"
     )
 
@@ -576,8 +607,24 @@ function Set-FsFolderSecurity {
 
     $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($groupSid, $script:fsShareGroupRights, $everything, $propagate, $allow)))
 
+    # The read-only tier, when the design names one. A missing group here is an error
+    # rather than a silent omission: the descriptor is rebuilt from scratch on every run,
+    # so carrying on would publish a share that reads to its designer as having readers
+    # and to everybody in that group as access denied.
+    $readDescription = ""
+    if (-not [string]::IsNullOrWhiteSpace($ReadGroupName)) {
+        $readSid = Get-FsGroupSid -Name $ReadGroupName
+        if ($null -eq $readSid) {
+            Write-Log "Read-only group '$ReadGroupName' does not resolve - '$Path' has no read-only tier" -Tag "Error"
+            [System.IO.Directory]::SetAccessControl((Get-Item -LiteralPath $Path).FullName, $acl)
+            return $false
+        }
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($readSid, $script:fsReadGroupRights, $everything, $propagate, $allow)))
+        $readDescription = ", '$ReadGroupName' read and execute"
+    }
+
     [System.IO.Directory]::SetAccessControl((Get-Item -LiteralPath $Path).FullName, $acl)
-    Write-Log "ACL '$Path': inheritance off, Administrators + SYSTEM full, '$GroupName' full minus perms/ownership" -Tag "Ok"
+    Write-Log "ACL '$Path': inheritance off, Administrators + SYSTEM full, '$GroupName' full minus perms/ownership$readDescription" -Tag "Ok"
     return $true
 }
 
@@ -636,9 +683,18 @@ function Set-FsSmbShare {
     # Share permissions stay coarse on purpose: the group and local Administrators
     # at Full, nothing else - Everyone is never granted, and NTFS above carries the
     # real decision.
+    #
+    # The read-only group is the one exception and it is granted Read rather than Full.
+    # The effective right is identical either way - NTFS already stops it writing - but a
+    # share whose permission tab says Full control for a group that cannot create a file
+    # is a tab nobody trusts the second time they read it, and the two halves of one
+    # design disagreeing on screen is how somebody ends up "fixing" the NTFS side.
     $grantees = @($Share.Group, "BUILTIN\Administrators")
+    $readers = @()
+    if (-not [string]::IsNullOrWhiteSpace($Share.ReadGroup)) { $readers = @($Share.ReadGroup) }
     if ($null -eq $existing) {
         $parameters = @{ Name = $smbName; Path = $Path; FullAccess = $grantees; Description = $Share.Description; ErrorAction = "Stop" }
+        if ($readers.Count -gt 0) { $parameters["ReadAccess"] = $readers }
         foreach ($key in $scoped.Keys) { $parameters[$key] = $scoped[$key] }
         if ($ContinuouslyAvailable) { $parameters["ContinuouslyAvailable"] = $true }
         $null = New-SmbShare @parameters
@@ -648,6 +704,14 @@ function Set-FsSmbShare {
         # Re-assert the grants; a grant that is already present is a no-op.
         foreach ($grantee in $grantees) {
             $null = Grant-SmbShareAccess -Name $smbName @scoped -AccountName $grantee -AccessRight Full -Force -ErrorAction Stop
+        }
+        # Revoked first, then granted at Read: Grant-SmbShareAccess adds a second ACE
+        # rather than replacing the one that is there, and a group that was Full on an
+        # earlier run would keep it. The revoke of a name that is not on the share is a
+        # no-op, which is why it is safe to do unconditionally.
+        foreach ($reader in $readers) {
+            $null = Revoke-SmbShareAccess -Name $smbName @scoped -AccountName $reader -Force -ErrorAction SilentlyContinue
+            $null = Grant-SmbShareAccess -Name $smbName @scoped -AccountName $reader -AccessRight Read -Force -ErrorAction Stop
         }
         # By SID, never by the name: "Everyone" is Jeder on a German server, the revoke
         # would match nothing, and SilentlyContinue would swallow it - leaving the
@@ -1138,7 +1202,7 @@ function Set-FsDfsNamespace {
         # the console's "Set explicit view permissions on the DFS folder" does, and it
         # is the switch that makes the setting mean something.
         if ($enumeration) {
-            if (-not (Grant-FsDfsFolderView -Path $linkPath -GroupName $share.Group)) { $allLinked = $false }
+            if (-not (Grant-FsDfsFolderView -Path $linkPath -GroupName $share.Group -ReadGroupName $share.ReadGroup)) { $allLinked = $false }
         }
     }
     return $allLinked
@@ -1151,15 +1215,21 @@ function Set-FsDfsNamespace {
 function Grant-FsDfsFolderView {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$GroupName
+        [Parameter(Mandatory)][string]$GroupName,
+        # The read-only tier sees the link for the same reason the read/write one does:
+        # this is a *view* permission on a namespace folder, not access to what is behind
+        # it. Leaving it out would hide the folder from exactly the people the share was
+        # designed to be readable by.
+        [string]$ReadGroupName = ""
     )
 
     $netbios = [string]$env:USERDOMAIN
     $accounts = @("BUILTIN\Administrators")
-    if (-not [string]::IsNullOrWhiteSpace($GroupName)) {
-        if ($GroupName.Contains("\")) { $accounts += $GroupName }
-        elseif (-not [string]::IsNullOrWhiteSpace($netbios)) { $accounts += ("{0}\{1}" -f $netbios, $GroupName) }
-        else { $accounts += $GroupName }
+    foreach ($name in @($GroupName, $ReadGroupName)) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if ($name.Contains("\")) { $accounts += $name }
+        elseif (-not [string]::IsNullOrWhiteSpace($netbios)) { $accounts += ("{0}\{1}" -f $netbios, $name) }
+        else { $accounts += $name }
     }
 
     $granted = $true
@@ -1174,7 +1244,8 @@ function Grant-FsDfsFolderView {
         }
     }
     if ($granted) {
-        Write-Log "$Path view: Administrators + '$GroupName' only" -Tag "Ok"
+        $named = @($GroupName, $ReadGroupName) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        Write-Log "$Path view: Administrators + '$($named -join "', '")' only" -Tag "Ok"
     }
     return $granted
 }
@@ -1226,13 +1297,22 @@ function Get-FsDriveMapPath {
     return "\\{0}\{1}" -f $computerName, (Get-FsSmbName -Share $Share)
 }
 
+# The item-level targeting is one FilterGroup per group, and the two entries read the
+# pair in opposite directions. The Update entry is an OR - in the read/write group OR in
+# the read-only one, because both need the letter and what they may do once it is open is
+# the folder's decision rather than the drive's. The Delete entry is an AND of two NOTs -
+# in neither - so losing one membership while holding the other leaves the drive alone,
+# and losing both unmounts it. A single-group design writes exactly one FilterGroup per
+# entry, which is byte-for-byte what this wrote before the second tier existed.
 function New-FsDriveMapXml {
     param(
         [Parameter(Mandatory)][string]$Letter,
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Label,
         [Parameter(Mandatory)][string]$GroupName,
-        [Parameter(Mandatory)][string]$GroupSid
+        [Parameter(Mandatory)][string]$GroupSid,
+        [string]$ReadGroupName = "",
+        [string]$ReadGroupSid = ""
     )
 
     $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
@@ -1240,21 +1320,40 @@ function New-FsDriveMapXml {
     $deleteUid = Get-StudioStableGuid -Seed ("delete-" + $Letter + "-" + $Path)
     $escapedPath  = [System.Security.SecurityElement]::Escape($Path)
     $escapedLabel = [System.Security.SecurityElement]::Escape($Label)
-    $escapedGroup = [System.Security.SecurityElement]::Escape($GroupName)
+
+    $targets = @([pscustomobject]@{ Name = $GroupName; Sid = $GroupSid })
+    if ((-not [string]::IsNullOrWhiteSpace($ReadGroupName)) -and (-not [string]::IsNullOrWhiteSpace($ReadGroupSid))) {
+        $targets += [pscustomobject]@{ Name = $ReadGroupName; Sid = $ReadGroupSid }
+    }
+
+    # The first item's operator is ignored by the client - there is nothing to its left -
+    # so the console writes AND there whatever the rest are, and so does this.
+    $filterLine = {
+        param($target, $operator, $negate)
+        '      <FilterGroup bool="' + $operator + '" not="' + $negate + '" name="' +
+            [System.Security.SecurityElement]::Escape($target.Name) + '" sid="' + $target.Sid +
+            '" userContext="1" primaryGroup="0" localGroup="0"/>'
+    }
+    $updateFilters = @()
+    $deleteFilters = @()
+    for ($index = 0; $index -lt $targets.Count; $index++) {
+        $updateFilters += (& $filterLine $targets[$index] $(if ($index -eq 0) { "AND" } else { "OR" }) "0")
+        $deleteFilters += (& $filterLine $targets[$index] "AND" "1")
+    }
 
     return @(
         '<?xml version="1.0" encoding="utf-8"?>',
         '<Drives clsid="{8FDDCC1A-0C3C-43cd-A6B4-71A6DF20DA8C}">',
         ('  <Drive clsid="{935D1B74-9CB8-4e3c-9914-7DD559B7A417}" name="' + $Letter + ':" status="' + $Letter + ':" image="2" changed="' + $stamp + '" uid="' + $updateUid + '" bypassErrors="1">'),
         ('    <Properties action="U" thisDrive="NOCHANGE" allDrives="NOCHANGE" userName="" path="' + $escapedPath + '" label="' + $escapedLabel + '" persistent="1" useLetter="1" letter="' + $Letter + '"/>'),
-        '    <Filters>',
-        ('      <FilterGroup bool="AND" not="0" name="' + $escapedGroup + '" sid="' + $GroupSid + '" userContext="1" primaryGroup="0" localGroup="0"/>'),
+        '    <Filters>'
+    ) + $updateFilters + @(
         '    </Filters>',
         '  </Drive>',
         ('  <Drive clsid="{935D1B74-9CB8-4e3c-9914-7DD559B7A417}" name="' + $Letter + ':" status="' + $Letter + ':" image="3" changed="' + $stamp + '" uid="' + $deleteUid + '" bypassErrors="1">'),
         ('    <Properties action="D" thisDrive="NOCHANGE" allDrives="NOCHANGE" userName="" path="" label="" persistent="0" useLetter="1" letter="' + $Letter + '"/>'),
-        '    <Filters>',
-        ('      <FilterGroup bool="AND" not="1" name="' + $escapedGroup + '" sid="' + $GroupSid + '" userContext="1" primaryGroup="0" localGroup="0"/>'),
+        '    <Filters>'
+    ) + $deleteFilters + @(
         '    </Filters>',
         '  </Drive>',
         '</Drives>'
@@ -1322,6 +1421,21 @@ function Sync-FsDriveMapGpo {
             continue
         }
 
+        # The read-only tier is targeted beside it. A named group whose SID cannot be
+        # read stops the object rather than writing half of it: a Drives.xml carrying one
+        # filter is a policy that mounts the drive for the writers and silently for
+        # nobody else, which is the same file a single-group design writes and therefore
+        # gives a reader nothing to notice.
+        $readGroupSid = ""
+        if (-not [string]::IsNullOrWhiteSpace($map.Share.ReadGroup)) {
+            $readGroupSid = Get-StudioGroupSid -Name $map.Share.ReadGroup
+            if ([string]::IsNullOrWhiteSpace($readGroupSid)) {
+                Write-Log "'$gpoName' targets missing read-only group '$($map.Share.ReadGroup)' - see the group sync above" -Tag "Error"
+                $allCreated = $false
+                continue
+            }
+        }
+
         try {
             $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
             if ($null -eq $gpo) {
@@ -1336,10 +1450,17 @@ function Sync-FsDriveMapGpo {
             if ($gpo.GpoStatus -ne "ComputerSettingsDisabled") { $gpo.GpoStatus = "ComputerSettingsDisabled" }
 
             $policyFolder = Set-StudioGpoUserExtension -Gpo $gpo -Extension $script:fsDriveMapExtension
+            $readGroupName = ""
+            if (-not [string]::IsNullOrWhiteSpace($readGroupSid)) {
+                $readGroupName = "{0}\{1}" -f $netbios, $map.Share.ReadGroup
+            }
             $xml = New-FsDriveMapXml -Letter $map.Letter -Path $path -Label $map.Label `
-                -GroupName ("{0}\{1}" -f $netbios, $map.Share.Group) -GroupSid $groupSid
+                -GroupName ("{0}\{1}" -f $netbios, $map.Share.Group) -GroupSid $groupSid `
+                -ReadGroupName $readGroupName -ReadGroupSid $readGroupSid
             Write-StudioGpoPreferenceFile -PolicyFolder $policyFolder -Folder "Drives" -FileName "Drives.xml" -Content $xml
-            Write-Log "'$gpoName': $($map.Letter): -> $path (update in '$($map.Share.Group)', delete outside)" -Tag "Ok"
+            $targetText = "'$($map.Share.Group)'"
+            if (-not [string]::IsNullOrWhiteSpace($readGroupSid)) { $targetText += " or '$($map.Share.ReadGroup)'" }
+            Write-Log "'$gpoName': $($map.Letter): -> $path (update in $targetText, delete outside)" -Tag "Ok"
 
             if (-not (Set-StudioGpoLink -Name $gpoName -TargetDn $linkTo `
                         -UnlinkedNote "link it to the users' OU when ready")) {
@@ -1458,14 +1579,31 @@ function Test-FsPrerequisite {
 
     # The share groups are a prerequisite here, the same rule as the Remote Desktop
     # access groups: created on the domain controller run (or by hand), never by
-    # the file server.
+    # the file server. DomainLocal in the printed line because that is what this run
+    # creates on a domain controller, and the two have to agree - a group made by hand
+    # from a line that says Global is adopted as it stands and nothing re-scopes it.
     $groups = Get-StudioGroupDefinition -Entries (Get-ConfigArray -InputObject $fileServer -Name "groups")
     foreach ($group in $groups) {
         $found = $null
         try { $found = Find-AdcsGroup -Name $group.Name } catch { $found = $null }
         if ($null -eq $found) {
             Write-Log "Share group '$($group.Name)' does not exist - run this config on a domain controller first" -Tag "Error"
-            Write-Log "    New-ADGroup -Name '$($group.Name)' -GroupScope Global -GroupCategory Security" -Tag "Error"
+            Write-Log "    New-ADGroup -Name '$($group.Name)' -GroupScope DomainLocal -GroupCategory Security" -Tag "Error"
+            $passed = $false
+        }
+    }
+
+    # Each share's read-only group, when it names one. It is checked here rather than
+    # only through the groups list because a design edited outside the studio can name a
+    # group the list does not carry, and the failure that produces is a share published
+    # with an ACL that is missing half of what the design says it grants.
+    foreach ($share in (Get-FsShare -FileServer $fileServer)) {
+        if ([string]::IsNullOrWhiteSpace($share.ReadGroup)) { continue }
+        $found = $null
+        try { $found = Find-AdcsGroup -Name $share.ReadGroup } catch { $found = $null }
+        if ($null -eq $found) {
+            Write-Log "Read-only group '$($share.ReadGroup)' for share '$($share.Name)' does not exist - run this config on a domain controller first" -Tag "Error"
+            Write-Log "    New-ADGroup -Name '$($share.ReadGroup)' -GroupScope DomainLocal -GroupCategory Security" -Tag "Error"
             $passed = $false
         }
     }
@@ -1515,8 +1653,13 @@ function Invoke-FsConfiguration {
     if (Test-StudioDomainController) {
         Write-Log "Domain controller: share groups and members" -Tag "Run"
         $allSynced = $true
+        # DomainLocal, not Global: these name a RESOURCE - the folders on one file
+        # server - and domain local is the scope that may hold accounts and global
+        # groups from anywhere in the forest and be written straight into an ACL here.
+        # That is the resource half of AGDLP, and it is what a group called
+        # 'Share - HR - RW' is. An existing group is adopted with whatever scope it has.
         foreach ($group in $groups) {
-            if (-not (Sync-StudioAccessGroup -Name $group.Name -Description "File share access group" -MemberUpn $group.Members)) {
+            if (-not (Sync-StudioAccessGroup -Name $group.Name -Description "File share access group" -MemberUpn $group.Members -Scope "DomainLocal")) {
                 $allSynced = $false
             }
         }
@@ -1586,7 +1729,7 @@ function Invoke-FsConfiguration {
             $failures += $share.Name
             continue
         }
-        if (-not (Set-FsFolderSecurity -Path $sharePath -GroupName $share.Group -AccessModel $share.AccessModel)) {
+        if (-not (Set-FsFolderSecurity -Path $sharePath -GroupName $share.Group -ReadGroupName $share.ReadGroup -AccessModel $share.AccessModel)) {
             $failures += $share.Name
             continue
         }
