@@ -7,7 +7,7 @@ logs/
 # Installers the run fetches (Windows Admin Center is ~130 MB)
 downloads/
 
-# Example Buils
+# Example builds
 examples/*
 
 # The old scripts kept around as reference, not part of the deployment.

@@ -112,7 +112,7 @@ knowing before you run it anywhere else:
 <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> WindowsServer-RoleStudio
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/overview-dark.png"><img src=".github/assets/icons/overview-light.png" width="16" alt=""></picture> html\ServerRoleConfigurator.html   the studio, one self-contained file
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/powershell-dark.png"><img src=".github/assets/icons/powershell-light.png" width="16" alt=""></picture> Configure-ServerRoles.ps1          the script you run
-├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/powershell-dark.png"><img src=".github/assets/icons/powershell-light.png" width="16" alt=""></picture> pwsh\                             one file per role, loaded by the script
+├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> pwsh\                             one file per role, loaded by the script
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/install-media-dark.png"><img src=".github/assets/icons/install-media-light.png" width="16" alt=""></picture> isos\                             installation media, never committed
 └─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/settings-dark.png"><img src=".github/assets/icons/settings-light.png" width="16" alt=""></picture> logs\                             one log per run, timestamped
 </pre>
@@ -133,7 +133,7 @@ folder to the server. I name mine after the role and keep them on `C:\`:
 <pre>
 <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> C:\role-adcs
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/powershell-dark.png"><img src=".github/assets/icons/powershell-light.png" width="16" alt=""></picture> Configure-ServerRoles.ps1
-├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/powershell-dark.png"><img src=".github/assets/icons/powershell-light.png" width="16" alt=""></picture> pwsh\
+├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> pwsh\
 └─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/settings-dark.png"><img src=".github/assets/icons/settings-light.png" width="16" alt=""></picture> config.json
 </pre>
 <div align="justify">
