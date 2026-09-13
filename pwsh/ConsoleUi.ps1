@@ -1452,6 +1452,16 @@ function Show-PrintSummary {
     if ($portNames.Count -gt 0) { $portText = $portNames -join ", " }
     Write-FastfetchInfoRow -Label "ports" -Value $portText -LabelWidth 24 -IndentWidth 2
 
+    # The whole-server answer, above the queues that follow it. Every queue below either
+    # inherits this or overrides it, and its own row says which it ended up with.
+    $serverRights = [string](Get-ConfigText -InputObject $PrintServer -Name "permissions" -Default "authenticated")
+    $serverRightsText = switch ($serverRights) {
+        "group"     { "the deployment group + Domain Computers" }
+        "groupOnly" { "the deployment group only" }
+        default     { "Authenticated Users" }
+    }
+    Write-FastfetchInfoRow -Label "who may print" -Value $serverRightsText -LabelWidth 24 -IndentWidth 2
+
     $queues = Get-PrintQueue -PrintServer $PrintServer
     Write-FastfetchInfoRow -Label "printers" -Value ("{0} queue(s)" -f $queues.Count) -LabelWidth 24 -IndentWidth 2
     foreach ($queue in $queues) {
@@ -1460,9 +1470,12 @@ function Show-PrintSummary {
         # Who it is DEPLOYED to, then who may PRINT on it. They are two different
         # questions and the queue row used to answer only the first, which reads as though
         # the group decided both - the thing this role spent a bench day proving wrong.
+        # Get-PrintQueue has already resolved 'inherit' against the server-wide answer,
+        # so this reports what the queue actually gets rather than what it stated.
         $mayPrint = switch ([string]$queue.Rights) {
             "authenticated" { "Authenticated Users may print" }
             "group"         { "only that group + Domain Computers may print" }
+            "groupOnly"     { "only that group may print" }
             default         { "Everyone may print" }
         }
         Write-FastfetchInfoRow -Label $queue.Name -Value ("shared as '{0}' -> {1}, {2}" -f $queue.ShareName, $target, $mayPrint) -LabelWidth 24 -IndentWidth 4

@@ -132,6 +132,13 @@ function Get-PrintPortDefinition {
 function Get-PrintQueue {
     param([Parameter(Mandatory)][object]$PrintServer)
 
+    # The server-wide answer, resolved once. Authenticated Users when the key is absent,
+    # which is what a design written before the General settings card existed would have
+    # been built under - and it changes nothing for such a design, because every printer
+    # in one reads as "default" rather than "inherit" and so never consults this.
+    $serverRights = Get-ConfigText -InputObject $PrintServer -Name "permissions" -Default "authenticated"
+    if ($serverRights -notin @("authenticated", "group", "groupOnly")) { $serverRights = "authenticated" }
+
     $queues = @()
     foreach ($printer in @(Get-ConfigArray -InputObject $PrintServer -Name "printers")) {
         $printerName = Get-ConfigText -InputObject $printer -Name "name"
@@ -146,10 +153,21 @@ function Get-PrintQueue {
         # belongs to the object rather than to each way it happens to be published. A config
         # written while it sat on the queue is still read, below, so an older file applies.
         $group    = Get-ConfigText -InputObject $printer -Name "group"
-        # Who may print, as opposed to who gets it pushed. Absent means the key predates
-        # the setting, and the safe reading of that is "change nothing" - see
-        # Set-PrintQueuePermission.
+        # Who may print, as opposed to who gets it pushed. Three readings, and the
+        # difference between the first two is the whole reason this is not one line:
+        #
+        #   absent      the key predates the setting entirely, and the safe reading of
+        #               that is "change nothing" - Everyone keeps Print. An older design
+        #               re-exported and run must not quietly strip every queue on a live
+        #               print server.
+        #   "inherit"   the printer was WRITTEN as following the server-wide answer, which
+        #               is a design somebody made rather than one nobody stated.
+        #   anything    this printer's own answer, whatever the server-wide one says.
+        #
+        # So absence cannot mean inherit here, and `$serverRights` is read once above the
+        # loop rather than per printer.
         $rights   = Get-ConfigText -InputObject $printer -Name "permissions" -Default "default"
+        if ($rights -eq "inherit") { $rights = $serverRights }
         $publish  = [bool](Get-ConfigValue -InputObject $printer -Name "publishInDirectory" -Default $false)
 
         $entries = @()
@@ -490,7 +508,7 @@ function Set-PrintQueuePermission {
             $sids = @("S-1-5-11")
             $label = "Authenticated Users"
         }
-        "group" {
+        { $_ -in @("group", "groupOnly") } {
             if ([string]::IsNullOrWhiteSpace([string]$Queue.Group)) {
                 Write-Log "'$($Queue.Name)' is set to print-by-group and names no group - its permissions are left alone" -Tag "Warn"
                 return $true
@@ -503,6 +521,17 @@ function Set-PrintQueuePermission {
                 return $true
             }
             $sids = @($groupSid)
+
+            # `groupOnly` stops here on purpose, and the cost is stated rather than
+            # discovered: without the machines, a client that has never had the driver is
+            # refused on its FIRST connect. It is a valid answer - drivers already staged,
+            # or clients that are not domain-joined and would not be in the group anyway -
+            # so it is a Warn on every pass rather than a refusal.
+            if ($mode -eq "groupOnly") {
+                Write-Log "'$($Queue.Name)': '$label' only, no Domain Computers - a client with no driver yet is refused on its first connect" -Tag "Warn"
+                Write-Log "    That refusal reads as 'Access is denied' while ADDING the printer. Stage the drivers, or use permissions 'group'" -Tag "Warn"
+                break
+            }
 
             # The machines, beside the people. Resolved as RID 515 off this domain's own
             # SID rather than by the name 'Domain Computers', which is written in whatever
@@ -560,12 +589,14 @@ function Set-PrintQueuePermission {
         # deployment GPO reports that as event 4098 with 0x80070005, which is a DIFFERENT
         # failure from the point-and-print one (0x80070bcb) that belongs to the client
         # hardening toolbox - the codes are how you tell them apart.
-        # Only for `group`. These describe what narrowing to a group of PEOPLE costs, and
-        # `authenticated` already includes the machine accounts - saying it there is
-        # telling somebody about a limit their own choice does not have.
-        if ($mode -eq "group") {
+        # Only for the group modes. These describe what narrowing to a group of PEOPLE
+        # costs, and `authenticated` already includes the machine accounts - saying it
+        # there is telling somebody about a limit their own choice does not have.
+        if ($mode -in @("group", "groupOnly")) {
             Write-Log "    Anybody not in it is refused when they connect, which is where the driver install happens" -Tag "Debug"
             Write-Log "    A refused user shows as event 4098 '0x80070005' on their machine - group membership, not point and print" -Tag "Debug"
+        }
+        if ($mode -eq "group") {
             # The driver fetch, which used to be the warning here and is now the second
             # ACE. Said at Debug rather than Warn because it is what the run DID, not
             # something left for somebody: the machines hold PRINTER_ACCESS_USE so a

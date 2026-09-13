@@ -5002,6 +5002,13 @@ function defaultPrint() {
     /* The name the deployment GPOs put in a UNC path. The DC run cannot ask the print
        server what it is called, which is the same reason the file server carries one. */
     root: { computerName: "" },
+    /* Who may print, for the whole server. Every printer follows it unless it has been
+       singled out, which is the same shape the file server's access-based enumeration
+       has: one answer on the general card, an override on the thing that wants a
+       different one. Authenticated Users because a default has to work on a fleet nobody
+       has touched, and because narrowing to a group is a decision about a printer rather
+       than the state a fresh design starts in. */
+    permissions: "authenticated",
     /* Point and Print / PrintNightmare client trust is deliberately NOT here: driver
        installation policy is CIS-hardening territory and another toolbox owns it. This
        design builds the server and the deployment; what a client may install is a
@@ -5048,23 +5055,67 @@ function createPrintVariation(label) {
 /* Who may print, as opposed to who the policy pushes the connection to. The default
    printer descriptor gives Everyone the Print right, so until this exists the deployment
    group decides who gets it installed and nothing decides who may use it.
-   Microsoft's printing best practice is the second and third of these; the first is what
-   Windows does on its own. */
+   Microsoft's printing best practice is the last three; the first is what Windows does on
+   its own.
+
+   `group` and `groupOnly` are the same group and differ by one ACE. Connecting to a
+   shared queue fetches the driver, and that fetch reaches the server as the client's
+   COMPUTER account - which is in no group of people - so `group` names the machines
+   beside the people (Domain Computers, by RID) and works on a client that has never had
+   the driver. `groupOnly` is the narrowest thing this studio will write and needs the
+   driver already staged on every client; it is the right answer where the printing
+   machines are not domain-joined, or where somebody genuinely wants no machine account
+   holding the print right. */
+const PRINT_SERVER_PERMISSION_MODES = [
+  { id: "authenticated", label: "Authenticated Users" },
+  { id: "group",         label: "Deployment group + Domain Computers" },
+  { id: "groupOnly",     label: "Deployment group only" }
+];
+/* Every printer, plus the two answers only a printer gives: follow the server-wide one,
+   which is what a printer says when nobody has singled it out, and leave the descriptor
+   as Windows made it. Everyone is not offered on the server-wide control - one switch
+   that opens every queue on the box to everybody is not a general setting, it is the
+   absence of one, and a design that wants it says so per printer. */
 const PRINT_PERMISSION_MODES = [
+  { id: "inherit",       label: "Follow the general setting" },
   { id: "default",       label: "Leave it as Windows made it (Everyone)" },
   { id: "authenticated", label: "Authenticated Users" },
-  { id: "group",         label: "The printer's deployment group (and Domain Computers)" }
+  { id: "group",         label: "Deployment group + Domain Computers" },
+  { id: "groupOnly",     label: "Deployment group only" }
 ];
+
+/* The server-wide answer. Authenticated Users by default: it is the one that works on a
+   fleet nobody has touched, and it is the mildest of the three - narrowing to a group is
+   a decision somebody makes about a printer, not the state a fresh design starts in. */
+function printServerPermissionMode(value) {
+  const wanted = String(value || "");
+  const known = PRINT_SERVER_PERMISSION_MODES.map(function (entry) { return entry.id; });
+  return (known.indexOf(wanted) === -1) ? "authenticated" : wanted;
+}
 
 /* Absent is not a choice - it is a design written before this setting existed, and the
    safe reading of that is "change nothing". A printer somebody adds today starts at
-   `group`; one that arrives from a file without the key stays at `default`, so exporting
-   an old design and running it does not quietly take Everyone off every queue on the
-   server. */
+   `inherit` and follows the card above; one that arrives from a file without the key
+   stays at `default`, so exporting an old design and running it does not quietly take
+   Everyone off every queue on the server. That asymmetry is why `inherit` is a value that
+   gets WRITTEN rather than the meaning of an absent key - the file server's per-share
+   access-based enumeration reads absence as inherit and is the opposite way round,
+   because nothing dangerous happens there when an old document is re-run. */
 function printPermissionMode(value) {
   const wanted = String(value || "");
   const known = PRINT_PERMISSION_MODES.map(function (entry) { return entry.id; });
   return (known.indexOf(wanted) === -1) ? "default" : wanted;
+}
+/* What a printer actually gets - its own answer, or the card's when it has none. Every
+   reader of "who may print on this queue" goes through here rather than reading the
+   printer's field, so the two can never disagree on screen. */
+function printEffectivePermission(printer) {
+  const own = printPermissionMode(printer && printer.permissions);
+  return (own === "inherit") ? printServerPermissionMode(state.print.permissions) : own;
+}
+function printPermissionLabel(id) {
+  const entry = PRINT_PERMISSION_MODES.filter(function (mode) { return mode.id === id; })[0];
+  return entry ? entry.label : id;
 }
 
 function createPrintPrinter(name) {
@@ -5079,31 +5130,34 @@ function createPrintPrinter(name) {
        whoever may print on it may print on it whichever queue they pick - so the group is
        a property of the object, not of each way it happens to be published. */
     group: "",
-    /* `group`, and this default has moved twice for one reason - the driver fetch.
+    /* `inherit`: a new printer follows the General settings card and nothing is answered
+       twice. The question itself - who may print, as opposed to who the policy pushes
+       the connection to - is answered on the card, and an override here is for the one
+       printer that wants a different answer from the rest of the server.
 
-       `group` is the tighter answer and it reads like the right one: the group the policy
-       targets is the group that holds Print, so "deployed to you" and "may print" cannot
-       drift apart. What it could not do was the FIRST connection. Connecting to a shared
-       queue fetches the driver, and that fetch reaches the print server as the client's
-       COMPUTER account - which is in no group of people. Field-observed 2026-09-05: a
-       user in the group, with the group in their token, refused; Print back on Everyone,
-       works. The default moved to `authenticated` on the strength of that.
+       The three the card offers, and why there are three rather than two: `group` is the
+       tighter answer and it reads like the right one - the group the policy targets is
+       the group that holds Print, so "deployed to you" and "may print" cannot drift
+       apart. What it could not do was the FIRST connection. Connecting to a shared queue
+       fetches the driver, and that fetch reaches the print server as the client's
+       COMPUTER account, which is in no group of people. Field-observed 2026-09-05: a user
+       in the group, with the group in their token, refused; Print back on Everyone,
+       works.
 
        A printer ACL cannot express "machines may fetch, users may print" - both are the
-       same `PRINTER_ACCESS_USE` right - but it CAN name the machines, and that is what
-       `group` now does: the deployment group plus **Domain Computers**, resolved by RID
-       off the domain's own SID. The fleet may fetch a driver; the people who may print
-       are still one group. That is strictly narrower than `authenticated`, which is every
-       account in the domain, and it works on a machine nobody has touched - so the reason
-       the default was not `group` has gone, and the default is `group` again.
+       same `PRINTER_ACCESS_USE` right - but it CAN name the machines, which is what
+       `group` does: the deployment group plus **Domain Computers**, resolved by RID off
+       the domain's own SID. `groupOnly` is that without the machines, for a fleet whose
+       drivers are already staged or whose clients are not domain-joined.
 
+         authenticated   every account in the domain, no anonymous or guest. The default.
          group           the deployment group, plus the machines for the driver fetch.
-         authenticated   every account in the domain, no anonymous or guest. The milder
-                         answer, and the one for a fleet that is not domain-joined.
+         groupOnly       the deployment group and nothing else. The narrowest, and the
+                         one that cannot serve a client with no driver yet.
 
        Designs written before any of this keep whatever they stated - an absent key still
-       reads as `default`. */
-    permissions: "group",
+       reads as `default`, never as `inherit`. */
+    permissions: "inherit",
     /* Off: this design deploys by policy, and a published queue is only reachable by a
        search nobody runs when the printer already arrives on its own. */
     publishInDirectory: false,
@@ -9995,6 +10049,22 @@ function validatePrintSection(issues, error, warn) {
     seenShares[share.toLowerCase()] = true;
   });
 
+  /* Said once for the design rather than once per printer, and it is a warning rather
+     than an error because it is a real answer with a real cost - not a mistake. The cost
+     is the one this role spent a bench day finding: the driver fetch arrives as the
+     client's computer account, which no group of people contains, so a printer nobody has
+     connected to yet refuses its first user however correct the membership is. */
+  const groupOnly = state.print.printers
+    .filter(function (printer) { return printEffectivePermission(printer) === "groupOnly"; })
+    .map(function (printer) { return String(printer.name || "").trim() || "a printer"; });
+  if (groupOnly.length) {
+    warn(where, "<strong>" + esc(groupOnly.join(", ")) + "</strong> " + (groupOnly.length === 1 ? "lets" : "let") +
+      " only the deployment group print, with no <code>Domain Computers</code>. A client that has not had the driver yet is refused on its " +
+      "first connect - the fetch arrives as the machine account, not the user's - and the symptom is <em>Access is denied</em> while " +
+      "<strong>adding</strong> the printer. Right where the drivers are already staged or the clients are not domain-joined; otherwise " +
+      "<strong>Deployment group + Domain Computers</strong> is the same narrowing without the hole.");
+  }
+
   return validateDhcpSection(issues, error, warn);
 }
 
@@ -10386,6 +10456,11 @@ function buildPrintSection() {
 
   return {
     root: { computerName: String(print.root.computerName || "").trim() },
+    /* The server-wide answer, always stated. A printer that says `inherit` is resolved
+       against this by the provider rather than by the studio, so the file says what was
+       designed - "every queue follows one rule" - instead of the same string copied onto
+       each printer, which is a design nobody can change in one place afterwards. */
+    permissions: printServerPermissionMode(print.permissions),
     drivers: print.drivers
       .map(function (driver) {
         return { name: String(driver.name || "").trim(), infPath: String(driver.infPath || "").trim() };
@@ -12602,6 +12677,11 @@ function applyCertificateTaskDocument(target, document) {
    was derived, and one that does not was typed. */
 function applyPrintDocument(target, source) {
   target.root.computerName = String((source.root || {}).computerName || "");
+  /* Absent falls back to Authenticated Users, which is the default a design that never
+     had this key would have been written under anyway. It changes nothing for such a
+     document: every printer in it reads as `default`, never `inherit`, so nothing
+     actually follows this until somebody sets a printer to follow it. */
+  target.permissions = printServerPermissionMode(source.permissions);
 
   target.drivers = (source.drivers || []).map(function (entry) {
     return createPrintDriver(entry.name, entry.infPath);
@@ -13665,6 +13745,7 @@ function mergePrintState(target, source) {
   if (!source) { return; }
 
   Object.assign(target.root, source.root || {});
+  target.permissions = printServerPermissionMode(source.permissions);
   target.groupPolicy.linkTo = ((source.groupPolicy || {}).linkTo || []).map(function (entry) {
     return createGpoLink(entry && entry.dn);
   });
@@ -22381,6 +22462,58 @@ function renderPrintRootCard() {
    left, the queue list on the right, and the ports underneath - drawn with the studio's
    own icons. Pure preview, nothing here is input; the same idea as the file server's
    Explorer card. */
+/* The whole-run half of the design, same place and same idea as the file server's card:
+   a question that is about the SERVER rather than about one printer. There is exactly one
+   of them here, and that is the honest count - drivers, ports, queues and policies are
+   each a list of decisions, and the only thing this role asks once is who may print. */
+function renderPrintGeneralCard() {
+  const mode = printServerPermissionMode(state.print.permissions);
+  const overridden = state.print.printers.filter(function (printer) {
+    return printPermissionMode(printer.permissions) !== "inherit";
+  }).length;
+
+  return cardOpen("settings.svg", "General settings", "Applied to every queue on this server, not to one printer",
+      '<span class="pill status on">' + esc(printPermissionLabel(mode)) + '</span>',
+      { key: "print-general", defaultOpen: true }) +
+    fieldSelect({ icon: "access-policies.svg", label: "Who may print", path: "print.permissions", rerender: true,
+      choices: PRINT_SERVER_PERMISSION_MODES,
+      hint: "Every printer below follows this unless it has been given its own answer. The deployment group decides who the policy " +
+        "<em>installs</em> a printer for; this decides who may <em>use</em> it - two different questions, and Windows answers the second " +
+        "with <strong>Everyone</strong> until something says otherwise." }) +
+
+    (mode === "authenticated"
+      ? infoBox("Print goes to <strong>Authenticated Users</strong> on every queue - everybody with an account in the domain, and no " +
+          "anonymous or guest session. The mildest of the three, and the default: it does not narrow printing to the people a printer is " +
+          "deployed to, but it works on a fleet nobody has touched. It includes <strong>computer accounts</strong>, so a client's first " +
+          "connection can fetch the driver as its own machine account.")
+      : "") +
+    (mode === "group"
+      ? infoBox("Print goes to each printer's <strong>deployment group</strong> and to <strong>Domain Computers</strong>, and comes off " +
+          "Everyone. The people who may print are one group per printer - narrower than Authenticated Users - and the machines are in there " +
+          "for one reason: connecting to a shared queue fetches the driver, and that fetch reaches this server as the client's " +
+          "<strong>computer account</strong>, which is in no group of people. A printer ACL cannot say <em>machines may fetch, users may " +
+          "print</em> - both are the same right - so the machines are named instead." +
+          "<br><br>Domain Computers is resolved by <strong>SID</strong> (the domain's own SID plus RID 515), never by the name, which is " +
+          "written in whatever language the forest was built in. Domain controllers are <em>not</em> members (they are RID 516), so a DC " +
+          "that is itself a print client needs its driver staged by hand.")
+      : "") +
+    (mode === "groupOnly"
+      ? infoBox("Print goes to each printer's <strong>deployment group</strong> and nothing else. The narrowest answer here, and the one " +
+          "with a cost worth reading twice: <strong>it cannot serve a client that does not have the driver yet.</strong> Connecting fetches " +
+          "the driver as the client's <strong>computer account</strong>, which is in no group of people, so a user who is in the group and " +
+          "has it in their token is still refused on a machine that has never printed here. Field-proven 2026-09-05. The symptom is " +
+          "<em>Access is denied</em> while <strong>adding</strong> the printer, which reads as a broken share rather than a permission." +
+          "<br><br>Pick it where the drivers are already staged on every client, or where the printing machines are not domain-joined and " +
+          "Domain Computers would mean nothing anyway. Otherwise <strong>Deployment group + Domain Computers</strong> above is the same " +
+          "narrowing without the first-connection hole.")
+      : "") +
+    (overridden
+      ? infoBox("<strong>" + overridden + "</strong> printer" + (overridden === 1 ? " has" : "s have") + " been given their own answer and " +
+          "will not follow this. Each one says so on its own card.")
+      : "") +
+  cardClose();
+}
+
 function renderPrintExplorerCard() {
   const server = printServerName() || "print-01";
   const queues = printQueues();
@@ -22651,17 +22784,29 @@ function renderPrintPrintersCard() {
         ? ""
         : warnBox("The group <code>" + esc(printer.group) + "</code> is not in the list on the <strong>Printer groups</strong> card.")) +
 
-      fieldSelect({ label: "Who may print", path: "print.printers." + index + ".permissions", rerender: true,
-        choices: PRINT_PERMISSION_MODES,
-        hint: "The group above decides who the policy <em>installs</em> this printer for. This decides who may <em>use</em> it - two different " +
-          "questions, and Windows answers the second with <strong>Everyone</strong> until something says otherwise. The group option carries " +
-          "<strong>Domain Computers</strong> with it, which is what lets a client that has never had the driver fetch one." }) +
+      (function () {
+        /* The first option says what following the card actually means, so the reader
+           never has to hold two screens in their head to answer "who may print on this
+           one". Everything below reads the EFFECTIVE mode, not the stored one, so an
+           inherited printer explains itself exactly like a singled-out one. */
+        const serverMode = printServerPermissionMode(state.print.permissions);
+        const choices = PRINT_PERMISSION_MODES.map(function (mode) {
+          return (mode.id === "inherit")
+            ? { id: mode.id, label: mode.label + " (" + printPermissionLabel(serverMode) + ")" }
+            : mode;
+        });
+        return fieldSelect({ label: "Who may print", path: "print.printers." + index + ".permissions", rerender: true,
+          choices: choices,
+          hint: "The group above decides who the policy <em>installs</em> this printer for. This decides who may <em>use</em> it - two " +
+            "different questions, and Windows answers the second with <strong>Everyone</strong> until something says otherwise. Leave it on " +
+            "<em>Follow the general setting</em> unless this one printer wants a different answer from the rest of the server." });
+      }()) +
 
-      (printPermissionMode(printer.permissions) === "default"
+      (printEffectivePermission(printer) === "default"
         ? infoBox("Every queue of this printer keeps the descriptor Windows gave it, where <strong>Everyone</strong> holds Print. Anybody who " +
             "types <code>\\" + esc(printServerName() || "prt-01") + "\&lt;share&gt;</code> can print on it whether the policy deployed it to them or not.")
         : "") +
-      (printPermissionMode(printer.permissions) === "group"
+      (printEffectivePermission(printer) === "group"
         ? infoBox("Print goes to <code>" + esc(String(printer.group || "").trim() || "the deployment group") + "</code> and to " +
             "<strong>Domain Computers</strong>, and comes off Everyone. Somebody outside the group is refused when they <strong>connect</strong>, " +
             "not when they print - installing the driver needs the Print right, so the symptom is <em>Access is denied</em> while adding the " +
@@ -22676,11 +22821,21 @@ function renderPrintPrintersCard() {
             "<br><br>Domain controllers are <em>not</em> members of Domain Computers (they are RID 516). That only matters where a DC is itself " +
             "a print client, and one that needs its driver staged by hand.")
         : "") +
-      (printPermissionMode(printer.permissions) === "authenticated"
+      (printEffectivePermission(printer) === "groupOnly"
+        ? infoBox("Print goes to <code>" + esc(String(printer.group || "").trim() || "the deployment group") + "</code> and nothing else, and " +
+            "comes off Everyone. <code>CREATOR OWNER</code>, <code>ALL APPLICATION PACKAGES</code> and the administrator entries are left exactly " +
+            "as they were." +
+            "<br><br><strong>This one cannot serve a client that does not have the driver yet.</strong> Connecting to a shared queue fetches the " +
+            "driver, and that fetch reaches this server as the client's <strong>computer account</strong> - which is in no group of people. " +
+            "Field-proven: a user in the group, with the group in their token, refused on a machine that had never had the driver; Print back on " +
+            "Everyone, works. Pick it where the drivers are already staged, or where the clients are not domain-joined and Domain Computers would " +
+            "mean nothing. Otherwise <strong>Deployment group + Domain Computers</strong> is the same narrowing without the hole.")
+        : "") +
+      (printEffectivePermission(printer) === "authenticated"
         ? infoBox("Print goes to <strong>Authenticated Users</strong> - everybody with an account in the domain, and no anonymous or guest session. " +
             "The milder answer: it does not narrow printing to the people this printer is deployed to. It includes <strong>computer accounts</strong>, " +
-            "so a client's first connection can fetch the driver as its own machine account. Pick it over the group above where the printing " +
-            "machines are not all domain-joined, or where the whole domain is meant to be able to print on this queue. The policy below is still " +
+            "so a client's first connection can fetch the driver as its own machine account. Pick a group above where the printing " +
+            "machines are all domain-joined and only some of the domain should print here. The policy below is still " +
             "what decides who the printer is <em>given</em> to; this only decides who is refused if they go looking for it by name.")
         : "") +
       toggleField({ label: "Publish in the directory", path: "print.printers." + index + ".publishInDirectory", rerender: true,
@@ -22741,6 +22896,7 @@ function renderPrint() {
 
     renderPrintRunbook() +
     renderPrintRootCard() +
+    renderPrintGeneralCard() +
     renderPrintExplorerCard() +
     renderPrintDriversCard() +
     renderPrintPortsCard() +
