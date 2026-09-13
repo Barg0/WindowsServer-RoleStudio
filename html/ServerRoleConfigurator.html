@@ -21485,9 +21485,19 @@ function renderFsDriveMapPolicyCard() {
       return [
         '<span class="dt-value">' + esc(fsDriveMapGpoName(share)) + '</span>',
         '<span class="dt-value">' + esc(String(share.driveLetter || "?") + ": -> " + fsSharePathFor(share)) + '</span>',
-        (String(share.group || "").trim()
-          ? '<span class="dt-value">' + esc(share.group) + '</span>'
-          : '<span class="dt-value is-none">No group picked</span>')
+        /* BOTH tiers, because both get the letter. The entry inside the object is one
+           item-level filter reading "in the read/write group OR in the read-only one" -
+           a reader needs the drive as much as a writer does, and what they may do once
+           it is open is the folder's decision rather than the drive's. Naming only the
+           read/write half here said the opposite of what the run writes. */
+        (function () {
+          const tiers = [String(share.group || "").trim(), String(share.readGroup || "").trim()].filter(Boolean);
+          if (!tiers.length) { return '<span class="dt-value is-none">No group picked</span>'; }
+          /* One value carrying both names rather than two siblings: the cell is a flex
+             row, so two spans would sit side by side with a 6px gap and read as one
+             run-on name. Stacked, the pair is legible and the column still narrows. */
+          return '<span class="dt-value">' + tiers.map(esc).join("<br>") + '</span>';
+        }())
       ];
     })) +
 
