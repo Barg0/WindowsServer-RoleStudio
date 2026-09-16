@@ -2224,8 +2224,8 @@ const TEMPLATE_CATALOG = [
        naming any other one would be wrong rather than merely broad. Not a decision,
        so the access panel renders these as facts. */
     fixedPrincipals: [
-      { name: "Domain Controllers", mode: "autoenroll" },
-      { name: "Enterprise Domain Controllers", mode: "autoenroll" }
+      { wellKnown: "domainControllers", mode: "autoenroll" },
+      { wellKnown: "enterpriseDomainControllers", mode: "autoenroll" }
     ],
     /* The copied EKUs include Client Authentication and Smart Card Logon - this
        certificate authenticates as the domain controller, which is why its
@@ -2320,7 +2320,7 @@ const TEMPLATE_CATALOG = [
     purpose: "The certificate an NPS server presents to 802.1X and VPN clients during PEAP or EAP-TLS, so they can tell a real RADIUS server from someone standing in for one.",
     note: "Client Authentication is dropped - NPS is checked for <strong>Server Authentication</strong> alone, and a server credential that can also authenticate <em>as</em> the machine is broader than the job. The subject must not be blank (NPS hides certificates without one) and the SAN must carry the server's DNS name, which is exactly what clients match against <em>Connect to these servers</em>. Enroll rather than autoenroll on purpose: see the renewal note below.",
     /* NPS servers are already a built-in group with exactly this membership. */
-    fixedPrincipals: [{ name: "RAS and IAS Servers", mode: "enroll" }],
+    fixedPrincipals: [{ wellKnown: "rasAndIasServers", mode: "enroll" }],
     supersedeTemplates: [],
     unpublishSuperseded: false,
     enrolleeSuppliesSubject: false,
@@ -2992,16 +2992,24 @@ const BROAD_PRINCIPALS = [
   "users", "domain guests", "guests", "anonymous logon"
 ];
 
-/* The built-in groups a design may seed an enrollment group with, carried in the
-   contract as a code rather than a name. The script turns each into a SID the same way
-   it resolves Domain Admins - WellKnownSidType does the RID arithmetic and
-   LDAP://<SID=...> binds straight to the object - so nothing depends on what the group
-   is called in the language the domain was installed in. A name would not merely fail
-   there: it would find nothing, and group creation would then mint an empty group by
-   the English name and grant it the template. */
+/* The Windows principals a design names without anybody typing them - the built-in
+   groups an enrollment group is seeded with, and the identity-bound principals a
+   template is granted to. Carried in the contract as a code rather than a name. The
+   script turns each into a SID the same way it resolves Domain Admins - WellKnownSidType
+   does the RID arithmetic and LDAP://<SID=...> binds straight to the object - so nothing
+   depends on what the group is called in the language the domain was installed in. A
+   name would not merely fail there: `Domain Controllers` is `Domaenencontroller` on a
+   German forest, and `NTAccount.Translate` on the English string throws, so the ACE is
+   simply never written - a Domain Controller Authentication template published, flagged
+   for autoenrollment, and holding no autoenroll right at all. That is a real bench
+   failure, on a German domain, and it is why nothing here is a name.
+   `rid` is the domain's own SID plus that number; `sid` is absolute and belongs to no
+   domain. Mirrored by $script:adcsWellKnownPrincipal in Role.Adcs.ps1. */
 const WELL_KNOWN_MEMBERS = {
   domainControllers: { label: "Domain Controllers", rid: 516 },
-  domainComputers: { label: "Domain Computers", rid: 515 }
+  domainComputers: { label: "Domain Computers", rid: 515 },
+  enterpriseDomainControllers: { label: "Enterprise Domain Controllers", sid: "S-1-5-9" },
+  rasAndIasServers: { label: "RAS and IAS Servers", rid: 553 }
 };
 
 /* The key usage extension, and the three values that matter here. This is the attribute
@@ -6404,13 +6412,29 @@ function seedMembersFor(catalog, grant) {
     return { wellKnown: entry.wellKnown, name: WELL_KNOWN_MEMBERS[entry.wellKnown].label };
   });
 }
-/* One list per right, fixed groups first - this is what the contract carries and
-   what the fact chips, the validation and the group creation all read. */
-function templatePrincipals(item) {
+/* The English name of a catalogue principal. WELL_KNOWN_MEMBERS is the one place it
+   is written down, so a label and the code beside it cannot drift apart. */
+function fixedPrincipalName(entry) {
+  if (!entry) { return ""; }
+  const known = WELL_KNOWN_MEMBERS[entry.wellKnown];
+  return String((known && known.label) || entry.name || "").trim();
+}
+/* One list per right, fixed principals first - this is what the CONTRACT carries.
+   Two shapes in those lists, on purpose: a plain string is a group this design names
+   (or somebody typed), and { wellKnown, name } is a Windows principal whose name is
+   written in the language the forest was installed in - the code is the identity and
+   the name rides along as a label for the log. The script resolves the code to a SID
+   and never looks the name up. */
+function templateContractPrincipals(item) {
   const catalog = templateCatalogEntry(item.id) || {};
   const result = { enroll: [], autoenroll: [] };
   (catalog.fixedPrincipals || []).forEach(function (entry) {
-    result[entry.mode === "autoenroll" ? "autoenroll" : "enroll"].push(entry.name);
+    const key = entry.mode === "autoenroll" ? "autoenroll" : "enroll";
+    if (entry.wellKnown) {
+      result[key].push({ wellKnown: entry.wellKnown, name: fixedPrincipalName(entry) });
+      return;
+    }
+    if (entry.name) { result[key].push(String(entry.name)); }
   });
   accessGrants(item.id).forEach(function (grant) {
     const name = effectiveGrantPrincipal(grant, item).trim();
@@ -6418,6 +6442,18 @@ function templatePrincipals(item) {
     result[grant.mode === "autoenroll" ? "autoenroll" : "enroll"].push(name);
   });
   return result;
+}
+function principalDisplayName(entry) {
+  return (entry && typeof entry === "object") ? String(entry.name || "") : String(entry || "");
+}
+/* The same two lists as names - what the fact chips, the validation and the
+   broad-principal check all read. Nothing on screen wants a code. */
+function templatePrincipals(item) {
+  const entries = templateContractPrincipals(item);
+  return {
+    enroll: entries.enroll.map(principalDisplayName),
+    autoenroll: entries.autoenroll.map(principalDisplayName)
+  };
 }
 /* The groups the script is asked to create: every mapped principal that is not a
    built-in and not something the design was told already exists. */
@@ -10982,8 +11018,8 @@ function buildAdcsTemplateSection(includeIds) {
         allowPrivateKeyExport: !!item.allowPrivateKeyExport,
         requireManagerApproval: !!item.requireManagerApproval,
         extendedKeyUsage: (catalog.extendedKeyUsage || []).slice(),
-        autoEnrollPrincipals: templatePrincipals(item).autoenroll,
-        enrollPrincipals: templatePrincipals(item).enroll,
+        autoEnrollPrincipals: templateContractPrincipals(item).autoenroll,
+        enrollPrincipals: templateContractPrincipals(item).enroll,
         supersedeTemplates: (catalog.supersedeTemplates || []).slice(),
         unpublishSuperseded: !!item.unpublishSuperseded
       });
@@ -12479,6 +12515,8 @@ function applyAdcsAccess(freshAdcs, pki) {
     const suffix = String(item.displayName || "").trim();
     if (!suffix) { return; }
     (item.enrollPrincipals || []).concat(item.autoEnrollPrincipals || []).forEach(function (name) {
+      /* A coded principal is never a derived group, so it says nothing about the prefix. */
+      if (name && typeof name === "object") { return; }
       const text = String(name || "");
       if (prefix === null && text.length > suffix.length && text.slice(-suffix.length) === suffix) {
         prefix = text.slice(0, text.length - suffix.length);
@@ -12493,12 +12531,18 @@ function applyAdcsAccess(freshAdcs, pki) {
     if (!catalog) { return; }
     const fixed = {};
     (catalog.fixedPrincipals || []).forEach(function (entry) {
-      fixed[entry.mode + ":" + String(entry.name).toLowerCase()] = true;
+      fixed[entry.mode + ":" + fixedPrincipalName(entry).toLowerCase()] = true;
     });
     const rows = [];
     [["enroll", item.enrollPrincipals], ["autoenroll", item.autoEnrollPrincipals]].forEach(function (pair) {
-      (pair[1] || []).forEach(function (name) {
-        const clean = String(name || "").trim();
+      (pair[1] || []).forEach(function (entry) {
+        /* A { wellKnown } entry is a fixed principal by definition: it comes from the
+           catalogue, not from anybody's decision. Read back as a grant it would render
+           as a group name to edit, and with group creation on the run would be asked to
+           CREATE a group by that name. The name form is still matched below, because a
+           file written before the code existed carries one. */
+        if (entry && typeof entry === "object") { return; }
+        const clean = String(entry || "").trim();
         if (!clean || fixed[pair[0] + ":" + clean.toLowerCase()]) { return; }
         const derived = catalog.suggestedGroup && catalog.suggestedGroup.mode === pair[0] &&
           clean === access.prefix + String(item.displayName || "").trim();
@@ -18555,7 +18599,8 @@ function renderAdcsAccessCard() {
 
             const fixed = (catalog.fixedPrincipals || []).map(function (entry) {
               return '<span class="tpl-fact"><strong>' + (entry.mode === "autoenroll" ? "Autoenroll" : "Enroll") + '</strong> ' +
-                esc(entry.name) + ' <span class="pill tag">Built in</span></span>';
+                esc(fixedPrincipalName(entry)) + ' <span class="pill tag">Built in</span>' +
+                (entry.wellKnown ? ' <span class="pill tag">By SID</span>' : "") + '</span>';
             }).join("");
 
             const rows = grants.map(function (grant, index) {

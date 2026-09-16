@@ -703,6 +703,9 @@ function Sync-AdcsScepHttpsEnrollmentGroup {
     $groupNames = @()
     $broad = @()
     foreach ($principal in @(Get-ConfigArray -InputObject $item -Name "enrollPrincipals")) {
+        # A { wellKnown } entry is a Windows principal, not a group anything can be put
+        # into - see Resolve-AdcsEnrollmentPrincipal. Nothing to add a member to.
+        if ($principal -isnot [string]) { continue }
         $name = ([string]$principal).Trim()
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
         if ($script:adcsScepBroadPrincipal -contains $name.ToLowerInvariant()) {
@@ -771,6 +774,9 @@ function Set-AdcsScepDirectory {
     foreach ($item in @(Get-ConfigArray -InputObject $templates -Name "items")) {
         if (-not [bool](Get-ConfigValue -InputObject $item -Name "scepTemplate" -Default $false)) { continue }
         foreach ($principal in @(Get-ConfigArray -InputObject $item -Name "enrollPrincipals")) {
+            # Same rule as the HTTPS certificate's group above: a coded principal is a
+            # Windows one, and the service account cannot be made a member of it.
+            if ($principal -isnot [string]) { continue }
             $name = [string]$principal
             if ([string]::IsNullOrWhiteSpace($name)) { continue }
             if ($groupNames -notcontains $name) { $groupNames += $name }

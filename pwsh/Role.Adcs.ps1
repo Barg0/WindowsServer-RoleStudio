@@ -1975,10 +1975,25 @@ function Get-AdcsDomainSid {
     }
 }
 
+# Whatever object holds this SID, as a distinguished name. LDAP://<SID=...> binds
+# straight to it, so nothing here depends on what it is called in this language.
+function Get-AdcsDnBySid {
+    param([Parameter(Mandatory)][object]$Sid)
+
+    try {
+        $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://<SID=$($Sid.Value)>")
+        $dn = [string]$entry.Properties["distinguishedName"].Value
+        if ([string]::IsNullOrWhiteSpace($dn)) { return "" }
+        return $dn
+    }
+    catch {
+        return ""
+    }
+}
+
 # A well-known group as a distinguished name, found by SID. WellKnownSidType does the
 # RID arithmetic - Domain Admins is the domain SID plus 512, Enterprise Admins the
-# *forest root* domain's SID plus 519 - and LDAP://<SID=...> binds straight to it, so
-# nothing here depends on what the group is called in this language.
+# *forest root* domain's SID plus 519 - so nothing here is a name either.
 function Get-AdcsWellKnownGroupDn {
     param(
         [Parameter(Mandatory)][System.Security.Principal.WellKnownSidType]$WellKnownType,
@@ -1989,10 +2004,7 @@ function Get-AdcsWellKnownGroupDn {
 
     try {
         $sid = New-Object System.Security.Principal.SecurityIdentifier($WellKnownType, $DomainSid)
-        $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://<SID=$($sid.Value)>")
-        $dn = [string]$entry.Properties["distinguishedName"].Value
-        if ([string]::IsNullOrWhiteSpace($dn)) { return "" }
-        return $dn
+        return Get-AdcsDnBySid -Sid $sid
     }
     catch {
         return ""
@@ -2737,29 +2749,98 @@ function Get-AdcsAccessRuleSid {
     return [string]$ruleSid
 }
 
-# A built-in group the design asks to be seeded into an enrollment group, as a
-# distinguished name. The contract carries a code and never a name, and this is why:
-# Domain Computers is Domaenencomputer on a German installation, so a name lookup there
-# does not fail - it finds nothing, and New-AdcsAccessGroup would go on to create an
-# empty group by the English name and grant it the template. WellKnownSidType does the
-# RID arithmetic against the domain SID, the same way Domain Admins is resolved for the
-# role groups.
-$script:adcsSeedMemberSid = @{
-    "domainControllers" = [System.Security.Principal.WellKnownSidType]::AccountControllersSid
-    "domainComputers"   = [System.Security.Principal.WellKnownSidType]::AccountComputersSid
+# ---------------------------[ Principals nobody types ]---------------------------
+# Every Windows principal the design names on its own: the built-in groups an enrollment
+# group is seeded with, and the identity-bound principals a template is granted to. The
+# contract carries a CODE for each and never a name, and this is why:
+#
+# Domain Computers is Domaenencomputer on a German installation. For a seed member a name
+# lookup there does not fail - it finds nothing, and New-AdcsAccessGroup would go on to
+# create an empty group by the English name and grant it the template. For a template
+# grant it is worse, because it *does* fail: on a German domain 'Domain Controllers'
+# threw out of NTAccount.Translate, so the Domain Controller Authentication template was
+# created, flagged for autoenrollment and left holding no autoenroll ACE at all - a
+# certificate no domain controller could ever enrol for, on a CA that reported the
+# template written. Bench-proven, on a German forest, which is why this table exists.
+#
+# DomainRelative says which of the two SID forms the type is. 516 and 515 and 553 are
+# RIDs on the account domain's own SID; Enterprise Domain Controllers is S-1-5-9, an
+# absolute SID belonging to no domain. The flag is what stops the first kind being built
+# with no domain SID: the SecurityIdentifier constructor documents domainSid as REQUIRED
+# for exactly the Account* types (and throws when it is absent), and as IGNORED for
+# every other type - so the flag also means "do not go and read the domain SID for a
+# value that would be thrown away".
+#
+# Label is the English name, for the log line when the SID cannot be translated. It is
+# never a lookup value. Mirrored by WELL_KNOWN_MEMBERS in the studio.
+$script:adcsWellKnownPrincipal = @{
+    "domainComputers"             = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::AccountComputersSid;        DomainRelative = $true;  Label = "Domain Computers" }
+    "domainControllers"           = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::AccountControllersSid;      DomainRelative = $true;  Label = "Domain Controllers" }
+    "enterpriseDomainControllers" = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::EnterpriseControllersSid;   DomainRelative = $false; Label = "Enterprise Domain Controllers" }
+    "rasAndIasServers"            = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::AccountRasAndIasServersSid; DomainRelative = $true;  Label = "RAS and IAS Servers" }
 }
 
-function Get-AdcsSeedMemberDn {
+# One of them as a SID, or $null with a line saying which and why. A code this build does
+# not know is a config from a newer studio: reported, never guessed at.
+function Get-AdcsWellKnownPrincipalSid {
     param([Parameter(Mandatory)][string]$Code)
 
     $key = $Code.Trim()
-    if (-not $script:adcsSeedMemberSid.ContainsKey($key)) {
-        Write-Log "Unknown seed member '$Code' - nothing was added for it" -Tag "Warn"
-        return ""
+    if (-not $script:adcsWellKnownPrincipal.ContainsKey($key)) {
+        Write-Log "'$Code' is not a well-known principal this script knows - nothing was resolved for it" -Tag "Warn"
+        return $null
     }
 
-    return Get-AdcsWellKnownGroupDn -WellKnownType $script:adcsSeedMemberSid[$key] `
-        -DomainSid (Get-AdcsDomainSid -NamingContext (Get-AdcsDefaultNamingContext))
+    $definition = $script:adcsWellKnownPrincipal[$key]
+    $domainSid = $null
+    if ($definition.DomainRelative) {
+        # Get-AdcsDefaultNamingContext THROWS when no domain answers, and this function's
+        # contract is "$null and a line saying why": an unresolvable principal is a
+        # reported grant failure that ends the role in ManualStepRequired, never an
+        # exception out of the middle of the template pass. The naming context is also
+        # checked for empty, because Get-AdcsDomainSid takes it as a mandatory parameter
+        # and an empty string fails the binding rather than the lookup.
+        $namingContext = ""
+        try { $namingContext = [string](Get-AdcsDefaultNamingContext) }
+        catch { $namingContext = "" }
+        if ([string]::IsNullOrWhiteSpace($namingContext)) {
+            Write-Log "No domain answered, so '$($definition.Label)' could not be resolved - it is a group in the account domain" -Tag "Warn"
+            return $null
+        }
+        $domainSid = Get-AdcsDomainSid -NamingContext $namingContext
+        if ($null -eq $domainSid) {
+            Write-Log "The account domain's SID could not be read, so '$($definition.Label)' could not be resolved" -Tag "Warn"
+            return $null
+        }
+    }
+
+    try {
+        return (New-Object System.Security.Principal.SecurityIdentifier($definition.Type, $domainSid))
+    }
+    catch {
+        Write-Log "Could not build the SID of '$($definition.Label)': $($_.Exception.Message)" -Tag "Warn"
+        return $null
+    }
+}
+
+# The name this machine prints for a SID - what the certificates console and the
+# security tab show, so a log line matches what somebody is looking at. Empty when the
+# SID does not resolve, which the callers treat as "use the English label".
+function Get-AdcsSidAccountName {
+    param([Parameter(Mandatory)][object]$Sid)
+
+    try { return [string]$Sid.Translate([System.Security.Principal.NTAccount]).Value }
+    catch { return "" }
+}
+
+# A seed member as a distinguished name, which is the form a group's `member` attribute
+# takes.
+function Get-AdcsSeedMemberDn {
+    param([Parameter(Mandatory)][string]$Code)
+
+    $sid = Get-AdcsWellKnownPrincipalSid -Code $Code
+    if ($null -eq $sid) { return "" }
+    return Get-AdcsDnBySid -Sid $sid
 }
 
 function Set-AdcsAccessGroup {
@@ -2999,46 +3080,88 @@ function New-AdcsTemplateOid {
     return $templateOid
 }
 
-function Grant-AdcsTemplateEnrollment {
-    param(
-        [Parameter(Mandatory)][object]$TemplateEntry,
-        [Parameter(Mandatory)][string]$Principal,
-        [switch]$AutoEnroll
-    )
+# One entry of enrollPrincipals / autoEnrollPrincipals, resolved to the SID the ACE is
+# written with. Two shapes in that list, and the difference is the whole point:
+#
+#   "Certificate - Web Services"                                a group this design names
+#   { wellKnown = "domainControllers"; name = "Domain Contr..." }   a Windows principal
+#
+# The second carries a code because its NAME is written in the language the forest was
+# installed in, and `name` is a label that rides along for the log. The code is resolved
+# through $script:adcsWellKnownPrincipal and the name is never looked up.
+#
+# Sid is $null when nothing resolved, which is the caller's to report - a template
+# granted to nobody is what this whole path exists to make impossible.
+function Resolve-AdcsEnrollmentPrincipal {
+    param([Parameter(Mandatory)][object]$Entry)
+
+    $label = ""
+    if ($Entry -isnot [string]) {
+        $code = [string](Get-ConfigValue -InputObject $Entry -Name "wellKnown" -Default "")
+        $label = [string](Get-ConfigValue -InputObject $Entry -Name "name" -Default "")
+        if (-not [string]::IsNullOrWhiteSpace($code)) {
+            $key = $code.Trim()
+            if ([string]::IsNullOrWhiteSpace($label) -and $script:adcsWellKnownPrincipal.ContainsKey($key)) {
+                $label = $script:adcsWellKnownPrincipal[$key].Label
+            }
+            if ([string]::IsNullOrWhiteSpace($label)) { $label = $key }
+
+            $sid = Get-AdcsWellKnownPrincipalSid -Code $key
+            if ($null -eq $sid) { return [pscustomobject]@{ Label = $label; Sid = $null } }
+            # Named in the language this domain actually uses, so the log line matches
+            # what the console shows. The SID is what gets written either way.
+            $localName = Get-AdcsSidAccountName -Sid $sid
+            if (-not [string]::IsNullOrWhiteSpace($localName)) { $label = $localName }
+            return [pscustomobject]@{ Label = $label; Sid = $sid }
+        }
+    }
+    else {
+        $label = [string]$Entry
+    }
+
+    $label = $label.Trim()
+    if ([string]::IsNullOrWhiteSpace($label)) { return $null }
 
     # A group this run created is taken from the cache rather than looked up: name
     # resolution can land on a DC that has not seen the new object yet, and the SID
     # read off the object at creation is not subject to that race.
-    $sid = $null
-    if ($script:adcsPrincipalSid.ContainsKey($Principal)) {
-        $sid = $script:adcsPrincipalSid[$Principal]
+    if ($script:adcsPrincipalSid.ContainsKey($label)) {
+        return [pscustomobject]@{ Label = $label; Sid = $script:adcsPrincipalSid[$label] }
     }
-    else {
-        try {
-            $account = New-Object System.Security.Principal.NTAccount($Principal)
-            $sid = [System.Security.Principal.SecurityIdentifier]$account.Translate([System.Security.Principal.SecurityIdentifier])
-        }
-        catch {
-            Write-Log "Could not resolve '$Principal' - nothing was granted on this template" -Tag "Error"
-            $script:adcsGrantFailure += $Principal
-            return $false
-        }
+    try {
+        $account = New-Object System.Security.Principal.NTAccount($label)
+        return [pscustomobject]@{ Label = $label
+            Sid = [System.Security.Principal.SecurityIdentifier]$account.Translate([System.Security.Principal.SecurityIdentifier]) }
     }
+    catch {
+        return [pscustomobject]@{ Label = $label; Sid = $null }
+    }
+}
+
+# The ACE, from a SID that is already resolved. Principal is the label for the log and
+# is never resolved here - see Resolve-AdcsEnrollmentPrincipal.
+function Grant-AdcsTemplateEnrollment {
+    param(
+        [Parameter(Mandatory)][object]$TemplateEntry,
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][object]$Sid,
+        [switch]$AutoEnroll
+    )
 
     try {
         $read = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $sid, [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+            $Sid, [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
             [System.Security.AccessControl.AccessControlType]::Allow)
         $TemplateEntry.ObjectSecurity.AddAccessRule($read)
 
         $enroll = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-            $sid, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+            $Sid, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
             [System.Security.AccessControl.AccessControlType]::Allow, $script:adcsEnrollRight)
         $TemplateEntry.ObjectSecurity.AddAccessRule($enroll)
 
         if ($AutoEnroll) {
             $auto = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-                $sid, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+                $Sid, [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
                 [System.Security.AccessControl.AccessControlType]::Allow, $script:adcsAutoEnrollRight)
             $TemplateEntry.ObjectSecurity.AddAccessRule($auto)
         }
@@ -3223,19 +3346,31 @@ function Set-AdcsTemplateEnrollmentAcl {
         [Parameter(Mandatory)][object]$Template
     )
 
+    # SIDs, not names: what this design wanted is compared against what the template
+    # holds, and the two are the same principal under two spellings often enough that
+    # comparing the spellings is how a grant this run just wrote gets reported as
+    # somebody else's.
     $wanted = @()
-    foreach ($principal in (Get-ConfigArray -InputObject $Template -Name "autoEnrollPrincipals")) {
-        $name = [string]$principal
-        $wanted += $name
-        $null = Grant-AdcsTemplateEnrollment -TemplateEntry $TemplateEntry -Principal $name -AutoEnroll
-    }
-    foreach ($principal in (Get-ConfigArray -InputObject $Template -Name "enrollPrincipals")) {
-        $name = [string]$principal
-        $wanted += $name
-        $null = Grant-AdcsTemplateEnrollment -TemplateEntry $TemplateEntry -Principal $name
+    foreach ($pair in @(@{ Name = "autoEnrollPrincipals"; Auto = $true }, @{ Name = "enrollPrincipals"; Auto = $false })) {
+        foreach ($principal in (Get-ConfigArray -InputObject $Template -Name $pair.Name)) {
+            $resolved = Resolve-AdcsEnrollmentPrincipal -Entry $principal
+            if ($null -eq $resolved) { continue }
+            if ($null -eq $resolved.Sid) {
+                Write-Log "Could not resolve '$($resolved.Label)' - nothing was granted on this template" -Tag "Error"
+                $script:adcsGrantFailure += $resolved.Label
+                continue
+            }
+            $wanted += [string]$resolved.Sid.Value
+            if ($pair.Auto) {
+                $null = Grant-AdcsTemplateEnrollment -TemplateEntry $TemplateEntry -Principal $resolved.Label -Sid $resolved.Sid -AutoEnroll
+            }
+            else {
+                $null = Grant-AdcsTemplateEnrollment -TemplateEntry $TemplateEntry -Principal $resolved.Label -Sid $resolved.Sid
+            }
+        }
     }
 
-    Write-AdcsTemplateExtraEnrollment -TemplateEntry $TemplateEntry -WantedPrincipal $wanted
+    Write-AdcsTemplateExtraEnrollment -TemplateEntry $TemplateEntry -WantedSid $wanted
 }
 
 
@@ -3246,14 +3381,14 @@ function Set-AdcsTemplateEnrollmentAcl {
 function Write-AdcsTemplateExtraEnrollment {
     param(
         [Parameter(Mandatory)][object]$TemplateEntry,
-        [string[]]$WantedPrincipal = @()
+        # The SIDs this design granted, as strings. Names were compared here once, and a
+        # localised name is not the one in the catalogue: on a German domain every grant
+        # this run wrote came back reported as coming from outside the design.
+        [string[]]$WantedSid = @()
     )
 
-    $wantedLower = @()
-    foreach ($name in $WantedPrincipal) { $wantedLower += $name.ToLowerInvariant() }
-
     try {
-        $rules = $TemplateEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])
+        $rules = $TemplateEntry.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
     }
     catch {
         Write-Log "Could not read the template's existing permissions: $($_.Exception.Message)" -Tag "Debug"
@@ -3266,11 +3401,14 @@ function Write-AdcsTemplateExtraEnrollment {
         if ($rule.ActiveDirectoryRights -ne [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) { continue }
         if (($rule.ObjectType -ne $script:adcsEnrollRight) -and ($rule.ObjectType -ne $script:adcsAutoEnrollRight)) { continue }
 
-        $identity = [string]$rule.IdentityReference
-        $short = $identity
-        if ($identity.Contains("\")) { $short = $identity.Split("\")[-1] }
+        $sidValue = Get-AdcsAccessRuleSid -Rule $rule
+        if ([string]::IsNullOrWhiteSpace($sidValue)) { continue }
+        if ($WantedSid -contains $sidValue) { continue }
 
-        if (($wantedLower -contains $identity.ToLowerInvariant()) -or ($wantedLower -contains $short.ToLowerInvariant())) { continue }
+        # Reported by name where this machine has one, because a bare SID sends the
+        # reader to the security tab to find out what it is.
+        $identity = Get-AdcsSidAccountName -Sid (New-Object System.Security.Principal.SecurityIdentifier($sidValue))
+        if ([string]::IsNullOrWhiteSpace($identity)) { $identity = $sidValue }
         if ($extra -contains $identity) { continue }
         $extra += $identity
     }
