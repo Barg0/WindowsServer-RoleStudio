@@ -2323,7 +2323,48 @@ function Set-ExchangeRelayConnector {
 
         $connector = Get-ReceiveConnector -Identity ("{0}\{1}" -f $env:COMPUTERNAME, $name) -ErrorAction Stop
         Set-ReceiveConnector -Identity $connector.Identity -PermissionGroups "AnonymousUsers" -ErrorAction Stop
-        $null = $connector | Add-ADPermission -User "NT AUTHORITY\ANONYMOUS LOGON" -ExtendedRights "ms-Exch-SMTP-Accept-Any-Recipient" -ErrorAction SilentlyContinue
+
+        # ANONYMOUS LOGON from its SID, S-1-5-7, which is NT-AUTORITAET\ANONYMOUS-
+        # ANMELDUNG on a German server. The English literal used to be passed here with
+        # -ErrorAction SilentlyContinue, which is the worst pairing available: on a
+        # localised Exchange the one grant that MAKES this a relay was never written and
+        # nothing said so, leaving a connector that looks finished, accepts anonymous
+        # mail, and refuses every address outside the organization. That is precisely
+        # the symptom nobody can explain, so it is an Error now and the step is not
+        # reported as done.
+        $anonymous = Get-StudioWellKnownAccountName -WellKnown ([System.Security.Principal.WellKnownSidType]::AnonymousSid) -Label "ANONYMOUS LOGON"
+        if ([string]::IsNullOrWhiteSpace($anonymous)) {
+            Write-Log "ANONYMOUS LOGON did not resolve on this server, so '$name' holds no ms-Exch-SMTP-Accept-Any-Recipient and cannot relay" -Tag "Error"
+            return $false
+        }
+
+        # Asked before it is written. Add-ADPermission on a right the connector already
+        # holds is not something to find out about through an exception on the second
+        # run of a design that is already correct.
+        $held = $false
+        try {
+            $held = @(Get-ADPermission -Identity $connector.Identity -User $anonymous -ErrorAction Stop |
+                Where-Object { (-not $_.Deny) -and (@($_.ExtendedRights | ForEach-Object { [string]$_ }) -contains "ms-Exch-SMTP-Accept-Any-Recipient") }).Count -gt 0
+        }
+        catch {
+            Write-Log "Could not read the permissions on '$name': $($_.Exception.Message)" -Tag "Debug"
+        }
+
+        if ($held) {
+            Write-Log "'$anonymous' already holds Accept-Any-Recipient on '$name'" -Tag "Debug"
+        }
+        else {
+            try {
+                $null = $connector | Add-ADPermission -User $anonymous -ExtendedRights "ms-Exch-SMTP-Accept-Any-Recipient" -ErrorAction Stop
+                Write-Log "'$anonymous' holds Accept-Any-Recipient on '$name'" -Tag "Ok"
+            }
+            catch {
+                Write-Log "Could not grant Accept-Any-Recipient to '$anonymous' on '$name': $($_.Exception.Message)" -Tag "Error"
+                Write-Log "    Without it the connector accepts anonymous mail for this organization's own domains only, which the Default Frontend connector already does" -Tag "Error"
+                return $false
+            }
+        }
+
         Write-Log "'$name' relays for the listed addresses only" -Tag "Info"
         return $true
     }

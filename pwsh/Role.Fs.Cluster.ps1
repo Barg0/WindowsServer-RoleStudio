@@ -634,9 +634,10 @@ function Invoke-FsClusterConfiguration {
         # than an omission: a clustered share's NTFS descriptor travels with the volume
         # and its share permissions live in the cluster registry, so every principal in
         # it has to mean the same thing on both nodes. Domain groups and well-known SIDs
-        # do; a machine-local group does not - BUILTIN\Administrators is the same
+        # do; a machine-local group does not - the Administrators group is the same
         # S-1-5-32-544 everywhere and resolves against whichever node owns the role,
-        # which is exactly the intent. The read-only tier changes none of that - it is
+        # which is exactly the intent. Named from that SID rather than typed, because
+        # the name it carries is the node's language (Get-StudioAdministratorsName). The read-only tier changes none of that - it is
         # one more domain group in the same descriptor.
         if (-not (Set-FsFolderSecurity -Path $sharePath -GroupName $share.Group -ReadGroupName $share.ReadGroup -AccessModel $share.AccessModel)) {
             $failures += $share.Name

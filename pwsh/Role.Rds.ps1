@@ -907,22 +907,50 @@ function Set-RdsLicensing {
 }
 
 # Per User CALs are only *tracked* while the license server's computer account is in
-# the domain's 'Terminal Server License Servers' group - and nothing reports the
+# the domain's Terminal Server License Servers group - and nothing reports the
 # omission until an audit does. The group is builtin and well known, the member is a
 # computer account this run already knows by name, and the account running this is a
 # domain administrator: the same ADSI writes the enrollment groups use reach it, so
-# 'nothing on this server can add it' stopped being true when those landed.
+# 'nothing on this server can add it' stopped being true when those landed. Found by
+# SID, because that group's name is written in the language of the domain.
 function Set-RdsLicenseServerGroup {
     param([Parameter(Mandatory)][string[]]$Server)
 
+    # The group is BUILTIN and its name is localised - CN=Terminalserver-Lizenzserver on
+    # a German domain - so the English distinguished name bound nothing there, the run
+    # fell through to its own "add it by hand" advice, and the command it printed failed
+    # the same way when pasted. Per User CALs then stop being tracked and nothing says
+    # so until an audit does.
+    #
+    # S-1-5-32-561 is that group on every domain in the world, and LDAP://<SID=...> binds
+    # straight to it whatever it is called here. Written as a SID string rather than
+    # through WellKnownSidType: the member for it exists, but as
+    # WinBuiltinTerminalServerLicenseServersSid with value 60 - the same value as
+    # MaxDefined, which is the kind of overlap a reader has to go and check. The SID is
+    # the thing being stated, so the SID is what this says.
+    $licenseGroupSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-561")
+
+    # Two names, in order of what they are worth. The SID translates through this
+    # machine's LSA, which answers in the language of the OS; the group's own
+    # sAMAccountName, read off the object once it is bound, is what the DOMAIN calls it
+    # and is the value Add-ADGroupMember -Identity takes. English last, so a log line
+    # still says something when neither answers.
+    $groupLabel = Get-AdcsSidAccountName -Sid $licenseGroupSid
+    if ([string]::IsNullOrWhiteSpace($groupLabel)) { $groupLabel = "Terminal Server License Servers" }
+
     $groupEntry = $null
     try {
-        $groupDn = "CN=Terminal Server License Servers,CN=Builtin," + (Get-AdcsDefaultNamingContext)
+        $groupDn = Get-AdcsDnBySid -Sid $licenseGroupSid
+        if ([string]::IsNullOrWhiteSpace($groupDn)) {
+            throw "no group with SID $($licenseGroupSid.Value) answered in this domain"
+        }
         $groupEntry = Get-AdcsDirectoryEntry -DistinguishedName $groupDn
+        $samAccountName = [string]$groupEntry.Properties["sAMAccountName"].Value
+        if (-not [string]::IsNullOrWhiteSpace($samAccountName)) { $groupLabel = $samAccountName }
     }
     catch {
-        Write-Log "Could not open 'Terminal Server License Servers': $($_.Exception.Message)" -Tag "Warn"
-        Write-Log "Add the license server(s) by hand: Add-ADGroupMember -Identity 'Terminal Server License Servers' -Members <server>$" -Tag "Info"
+        Write-Log "Could not open '$groupLabel': $($_.Exception.Message)" -Tag "Warn"
+        Write-Log "Add the license server(s) by hand: Add-ADGroupMember -Identity '$groupLabel' -Members <server>$" -Tag "Info"
         return
     }
 
@@ -943,13 +971,13 @@ function Set-RdsLicenseServerGroup {
             Write-Log "Could not search for the computer account of '$hostName': $($_.Exception.Message)" -Tag "Warn"
         }
         if ($null -eq $account) {
-            Write-Log "No computer account '$hostName$' in this domain - add the license server to 'Terminal Server License Servers' by hand" -Tag "Warn"
+            Write-Log "No computer account '$hostName$' in this domain - add the license server to '$groupLabel' by hand" -Tag "Warn"
             continue
         }
 
         $accountDn = [string]$account.Properties["distinguishedname"][0]
         if ($members -contains $accountDn) {
-            Write-Log "'$hostName' is already in 'Terminal Server License Servers'" -Tag "Info"
+            Write-Log "'$hostName' is already in '$groupLabel'" -Tag "Info"
             continue
         }
 
@@ -958,10 +986,10 @@ function Set-RdsLicenseServerGroup {
         try {
             $null = $groupEntry.Properties["member"].Add($accountDn)
             $groupEntry.CommitChanges()
-            Write-Log "Added '$hostName' to 'Terminal Server License Servers'" -Tag "Ok"
+            Write-Log "Added '$hostName' to '$groupLabel'" -Tag "Ok"
         }
         catch {
-            Write-Log "Could not add '$hostName' to 'Terminal Server License Servers': $($_.Exception.Message)" -Tag "Warn"
+            Write-Log "Could not add '$hostName' to '$groupLabel': $($_.Exception.Message)" -Tag "Warn"
             try { $groupEntry.RefreshCache(@("member")) } catch { Write-Log "Could not re-read the membership" -Tag "Debug" }
         }
     }

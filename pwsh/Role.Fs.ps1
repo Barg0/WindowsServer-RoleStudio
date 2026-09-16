@@ -689,7 +689,24 @@ function Set-FsSmbShare {
     # share whose permission tab says Full control for a group that cannot create a file
     # is a tab nobody trusts the second time they read it, and the two halves of one
     # design disagreeing on screen is how somebody ends up "fixing" the NTFS side.
-    $grantees = @($Share.Group, "BUILTIN\Administrators")
+    #
+    # Administrators by SID and never by the name. New-SmbShare and Grant-SmbShareAccess
+    # resolve an account name through the LSA, so "BUILTIN\Administrators" on a German
+    # server does not merely fail to match - the cmdlet throws and the share is not
+    # created at all. Same rule as the Everyone revoke below, and it covers the guest
+    # cluster too: that mode serves its shares through this function.
+    #
+    # An Administrators that does not resolve is reported and left out rather than
+    # failing the share: the group still gets its grant, and NTFS underneath carries the
+    # real decision either way.
+    $grantees = @($Share.Group)
+    $administrators = Get-StudioAdministratorsName
+    if ([string]::IsNullOrWhiteSpace($administrators)) {
+        Write-Log "The local Administrators group did not resolve - '$smbName' is granted to '$($Share.Group)' alone" -Tag "Error"
+    }
+    else {
+        $grantees += $administrators
+    }
     $readers = @()
     if (-not [string]::IsNullOrWhiteSpace($Share.ReadGroup)) { $readers = @($Share.ReadGroup) }
     if ($null -eq $existing) {
@@ -1224,7 +1241,19 @@ function Grant-FsDfsFolderView {
     )
 
     $netbios = [string]$env:USERDOMAIN
-    $accounts = @("BUILTIN\Administrators")
+    # By SID, for the same reason as the share grant - Grant-DfsnAccess resolves the
+    # name through the LSA. Louder than the share, though: the FIRST grant is what
+    # switches this folder off inherited, so the accounts granted here are the whole
+    # list afterwards and an Administrators that went missing is a link whoever manages
+    # the namespace can no longer see.
+    $accounts = @()
+    $administrators = Get-StudioAdministratorsName
+    if ([string]::IsNullOrWhiteSpace($administrators)) {
+        Write-Log "The local Administrators group did not resolve - '$Path' gets explicit view permissions WITHOUT it, so whoever manages the namespace stops seeing this folder" -Tag "Error"
+    }
+    else {
+        $accounts += $administrators
+    }
     foreach ($name in @($GroupName, $ReadGroupName)) {
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
         if ($name.Contains("\")) { $accounts += $name }
@@ -1245,7 +1274,9 @@ function Grant-FsDfsFolderView {
     }
     if ($granted) {
         $named = @($GroupName, $ReadGroupName) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        Write-Log "$Path view: Administrators + '$($named -join "', '")' only" -Tag "Ok"
+        $who = "'$($named -join "', '")' only"
+        if (-not [string]::IsNullOrWhiteSpace($administrators)) { $who = "$administrators + $who" }
+        Write-Log "$Path view: $who" -Tag "Ok"
     }
     return $granted
 }

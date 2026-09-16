@@ -170,10 +170,20 @@ function Get-StudioWellKnownAccountName {
     }
 }
 
-# The three this project actually needs, named once so a call site reads as intent
+# The ones this project actually needs, named once so a call site reads as intent
 # rather than as an enumeration member.
 function Get-StudioEveryoneName {
     return (Get-StudioWellKnownAccountName -WellKnown ([System.Security.Principal.WellKnownSidType]::WorldSid) -Label "Everyone")
+}
+
+# S-1-5-32-544, which is that same SID on every Windows machine in the world - and
+# 'VORDEFINIERT\Administratoren' on a German one. Wanted wherever a CMDLET is handed an
+# account NAME: New-SmbShare, Grant-SmbShareAccess and Grant-DfsnAccess all resolve the
+# string through the LSA, so the English literal does not fail to match - it fails the
+# call, and the share or the view permission is not written at all. An ACL built in
+# .NET takes the SID object directly and does not come through here.
+function Get-StudioAdministratorsName {
+    return (Get-StudioWellKnownAccountName -WellKnown ([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid) -Label "Administrators")
 }
 
 # ---------------------------[ Server names in UNC paths ]---------------------------
