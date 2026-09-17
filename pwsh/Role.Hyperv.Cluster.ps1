@@ -841,18 +841,18 @@ function New-HypervClusterS2dPool {
         return $false
     }
 
+    # Re-asserted on the pool, which is the only object that carries it: the fault domain
+    # lives on the pool as its default, and Set-ResiliencySetting has no parameter for it
+    # in any Windows Server release.
     $pool = Get-HypervClusterS2dPool
     if ($null -ne $pool) {
         try {
-            $null = Get-ResiliencySetting -StoragePool $pool -ErrorAction Stop |
-                Where-Object { $_.Name -eq "Mirror" -or $_.Name -eq "Parity" -or $_.Name -eq "Simple" } |
-                Set-ResiliencySetting -FaultDomainAwarenessDefault PhysicalDisk -ErrorAction Stop
+            $null = $pool | Set-StoragePool -FaultDomainAwarenessDefault PhysicalDisk -ErrorAction Stop
         }
         catch {
-            Write-Log "The resiliency settings kept their own fault domain: $($_.Exception.Message)" -Tag "Debug"
+            Write-Log "The pool kept its own fault domain: $($_.Exception.Message)" -Tag "Debug"
         }
     }
-    return $true
 
     # Microsoft's guest-cluster guidance, and it matters in a lab: a virtual disk is a
     # file, so the health service replacing one for a fault it 'sees' is the wrong answer,
@@ -1014,9 +1014,11 @@ function New-HypervClusterS2dVolume {
     # servers, Storage Spaces Direct automatically uses two-way mirroring" - and their
     # table counts *servers* as fault domains. This pool counts disks, because one node
     # has nothing else to count, so three and four copies are reachable here from three
-    # and four disks. Both parameters are set together: the copies and the number of
-    # failures they survive are the same statement said twice, and Storage Spaces wants
-    # to hear both. Parity is not offered at all - archive layout, running guests.
+    # and four disks. The copies are stated as -PhysicalDiskRedundancy, the failures the
+    # volume survives: New-Volume has no -NumberOfDataCopies (New-VirtualDisk and
+    # New-StorageTier do, and the two are the same statement said differently), and
+    # handing it one fails the call outright. Parity is not offered at all - archive
+    # layout, running guests.
     $copies = $MirrorCopies
     if ($copies -lt 1) { $copies = 1 }
     if ($copies -gt 4) { $copies = 4 }
@@ -1037,11 +1039,9 @@ function New-HypervClusterS2dVolume {
         # protected by nothing. It is the only thing a single-disk pool can hold, and it
         # is never chosen by default - the operator has to ask for it by name.
         $parameters["ResiliencySettingName"] = "Simple"
-        $parameters["NumberOfDataCopies"] = 1
     }
     else {
         $parameters["ResiliencySettingName"] = "Mirror"
-        $parameters["NumberOfDataCopies"] = $copies
         $parameters["PhysicalDiskRedundancy"] = ($copies - 1)
     }
     if ($SizeBytes -gt 0) { $parameters["Size"] = [uint64]$SizeBytes }

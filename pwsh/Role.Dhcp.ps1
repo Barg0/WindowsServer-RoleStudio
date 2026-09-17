@@ -382,7 +382,10 @@ function Set-DhcpScope {
     foreach ($reservation in $Scope.Reservations) {
         $existingReservation = $null
         try {
-            $existingReservation = Get-DhcpServerv4Reservation -ScopeId $Scope.ScopeId -IPAddress $reservation.IPAddress -ErrorAction SilentlyContinue
+            # By address alone: -ScopeId and -IPAddress are separate parameter sets, and
+            # naming both leaves the binder nothing to resolve. A reservation address is
+            # unique on the server, so the scope adds nothing to the lookup.
+            $existingReservation = Get-DhcpServerv4Reservation -IPAddress $reservation.IPAddress -ErrorAction SilentlyContinue
         }
         catch { $existingReservation = $null }
 

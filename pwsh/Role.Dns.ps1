@@ -92,7 +92,7 @@ function Set-DnsForwarder {
 
     Write-Log "Setting DNS forwarders to $($Address -join ', ')" -Tag "Run"
     try {
-        Set-DnsServerForwarder -IPAddress $Address -Force -ErrorAction Stop
+        Set-DnsServerForwarder -IPAddress $Address -ErrorAction Stop
     }
     catch {
         throw "Set-DnsServerForwarder failed: $($_.Exception.Message)"

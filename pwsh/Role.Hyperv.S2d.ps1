@@ -2714,8 +2714,9 @@ function New-HypervS2dVolume {
     }
     $shape = ""
     if ($Resiliency -eq "twoWayMirror") {
+        # One failure survived is two copies said the way New-Volume accepts it - the
+        # cmdlet has no -NumberOfDataCopies, unlike New-StorageTier below.
         $parameters["ResiliencySettingName"] = "Mirror"
-        $parameters["NumberOfDataCopies"] = 2
         $parameters["PhysicalDiskRedundancy"] = 1
         if ([long]$Share.Total -gt 0) { $parameters["Size"] = [uint64]$Share.Total } else { $parameters["UseMaximumSize"] = $true }
         $shape = "two-way mirrored (one copy per node)"
