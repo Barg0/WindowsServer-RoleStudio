@@ -86,17 +86,26 @@ $ErrorActionPreference = 'Stop'
 $scriptStartTime = Get-Date
 $script:logEnabled = $true
 $script:logDebug   = [bool]$LogDebug
-$script:currentRole = 'AD-Certificate'
+# Empty on purpose. The bracket after the tag names the ROLE a line was written
+# under, and this script is not running one - a [AD-Certificate] on every line of a
+# hand-run tool claims a run that never happened. The log still lands in logs\adcs\,
+# because that is where somebody looks for what happened to this CA.
+$script:currentRole = ''
 
 if ([string]::IsNullOrWhiteSpace($LogRoot)) {
-    # Beside the role's own runs when this is still in the toolbox, beside the script
-    # when it has been copied out alone. The sibling pwsh folder is what tells them apart.
-    $parent = Split-Path -Path $PSScriptRoot -Parent
-    if ((-not [string]::IsNullOrWhiteSpace($parent)) -and (Test-Path -LiteralPath (Join-Path -Path $parent -ChildPath 'pwsh'))) {
-        $LogRoot = $parent
-    }
-    else {
-        $LogRoot = $PSScriptRoot
+    # Beside the role's own runs when this is still in the toolbox, beside the
+    # script when it has been copied out alone.
+    # Walk up looking for the toolbox root rather than checking one level. The scripts
+    # folder is nested by area now - scripts\adcs\fixes - so the sibling pwsh folder
+    # that marks the root is three levels above this file, not one. Four levels is
+    # plenty and stops dead at the drive root; finding nothing means this script has
+    # been copied out on its own, and then its own folder is the right answer.
+    $LogRoot = $PSScriptRoot
+    $probe = $PSScriptRoot
+    for ($up = 0; $up -lt 4; $up++) {
+        if ([string]::IsNullOrWhiteSpace($probe)) { break }
+        if (Test-Path -LiteralPath (Join-Path -Path $probe -ChildPath 'pwsh')) { $LogRoot = $probe; break }
+        $probe = Split-Path -Path $probe -Parent
     }
 }
 

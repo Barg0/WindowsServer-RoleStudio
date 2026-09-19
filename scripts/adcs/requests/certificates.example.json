@@ -1,0 +1,28 @@
+{
+  "_comment": "Rename this to certificates.json next to the script and it runs as a batch. template and keyLength are defaults any certificate may override. outputFolder is optional - left out, everything lands beside the script.",
+  "_names": "dnsNames and ipAddresses are JSON arrays: every name in its own quotes, separated by a comma, all inside [ ]. A single string with commas or semicolons in it is accepted too, so \"fw-01, fw\" works.",
+
+  "template": "WebServices",
+  "keyLength": 2048,
+
+  "certificates": [
+    {
+      "commonName": "fw-01.ad.lab.invalid",
+      "dnsNames": [ "fw-01", "fw.ad.lab.invalid", "firewall.ad.lab.invalid" ],
+      "ipAddresses": [ "10.11.12.13", "10.11.12.14" ]
+    },
+    {
+      "commonName": "portal.ad.lab.invalid",
+      "dnsNames": [ "portal", "www.ad.lab.invalid" ],
+      "keyLength": 3072
+    },
+    {
+      "commonName": "backup.ad.lab.invalid",
+      "dnsNames": "backup, backup.lab.invalid",
+      "ipAddresses": "10.11.12.20"
+    },
+    {
+      "commonName": "logs.ad.lab.invalid"
+    }
+  ]
+}
