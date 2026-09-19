@@ -1544,7 +1544,7 @@ function Test-CertificateTaskScepOwner {
 
     $certificateServices = Get-ConfigValue -InputObject $Config -Name "certificateServices"
     if ($null -eq $certificateServices) { return $false }
-    $scep = Get-ConfigValue -InputObject $certificateServices -Name "scep"
+    $scep = Get-AdcsTierSection -CertificateServices $certificateServices -TierName "scep"
     if ($null -eq $scep) { return $false }
     if (-not [bool](Get-ConfigValue -InputObject $scep -Name "enabled" -Default $false)) { return $false }
 

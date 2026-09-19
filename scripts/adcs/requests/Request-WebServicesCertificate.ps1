@@ -98,10 +98,15 @@ $ErrorActionPreference = 'Stop'
 # =================================================================================
 # Kaido Dark, the studio's default theme, as the console's palette.
 #
-# Every hex is lifted verbatim from FAMILIES[kaido].dark in the studio HTML, so the
-# tool and the studio are the same colours rather than two guesses at them. Truecolor
-# when the console does virtual terminal processing, the nearest named colour when it
-# does not.
+# Every hex is lifted verbatim from FAMILIES[kaido].dark in the studio HTML - with one
+# stated exception, `yellow`, documented where it is defined below - so the tool and the
+# studio are the same colours rather than two guesses at them. Truecolor when the
+# console does virtual terminal processing, the nearest named colour when it does not.
+#
+# This is a COPY of the table in pwsh\Logging.ps1, not a reference to it, for the same
+# reason the rest of this file copies Write-Log: a retrofit has to keep working when
+# somebody puts it on a server on its own. The cost is that the two can drift, and the
+# rule is that a change to one is made by hand in the other on the same day.
 # =================================================================================
 $script:studioPalette = @{
     bg       = "#16171e"; elevated  = "#1d1f28"; subtle = "#1a1c24"; hover = "#262a38"
@@ -110,6 +115,13 @@ $script:studioPalette = @{
     accent   = "#7aa2f7"; accentHover = "#93b3fa"; accentSoft = "#22304f"; accentFg = "#11141c"
     success  = "#9ece6a"; danger    = "#f7768e"; warn = "#e0af68"
     bandHost = "#7dcfff"; bandIdent = "#bb9af7"; bandWork = "#9ece6a"; bandDeploy = "#ff9e64"
+    # THE ONE VALUE IN THIS TABLE THAT IS NOT THE STUDIO'S. Kaido has exactly two warm
+    # colours - warn #e0af68, a gold, and deploy #ff9e64, an orange - and a log needs
+    # three warm steps, because `info` is the commonest tag there is and it has to sit
+    # below `warn` without either reading as the other. Console-only, no studio
+    # counterpart, and none needed: the studio has no log. Same value, same reason, in
+    # pwsh\Logging.ps1.
+    yellow   = "#e6de78"
 }
 
 # One per key, for a console that cannot do truecolor. Chosen for the JOB the hex does,
@@ -122,6 +134,10 @@ $script:studioFallback = @{
     accent   = "Cyan";     accentHover = "White"; accentSoft = "DarkBlue"; accentFg = "Black"
     success  = "Green";    danger    = "Red";     warn = "DarkYellow"
     bandHost = "Cyan";     bandIdent = "Magenta"; bandWork = "Green";   bandDeploy = "Yellow"
+    # Yellow against warn's DarkYellow - the pair the sixteen-colour version of this log
+    # already used, which is what the truecolor palette had to grow a third warm step to
+    # be able to say.
+    yellow   = "Yellow"
 }
 
 # Write-Host with a palette key instead of a colour name. Everything on screen goes
@@ -231,19 +247,17 @@ function Write-Log {
     if ([string]::IsNullOrWhiteSpace($shown)) { $shown = 'error' }
     $rawTag = $shown.PadRight(5)
 
-    # Palette keys, not ConsoleColor names. The one relationship that had to survive
-    # the move is info reading QUIETER than warn - that is why the toolbox uses Yellow
-    # against DarkYellow. Here info is plain text and warn is the theme's amber.
-    # Palette keys, not ConsoleColor names, and the RELATIONSHIPS are what had to
-    # survive the move rather than the exact hues. Info is a yellow and warn is a
-    # louder orange, the same pair the toolbox gets from Yellow against DarkYellow -
-    # info was plain white here for one build and the log read as undifferentiated.
+    # Palette keys, not ConsoleColor names, and the pairing that has to survive is info
+    # reading QUIETER than warn without either of them reading as the other. Kaido's own
+    # two warm colours are one step apart and came out orange-on-orange; info as plain
+    # text was tried in an earlier build and the log read as undifferentiated. So the
+    # palette carries a third warm step and info takes it.
     $color = switch ($shown) {
         'start' { 'accent' }
         'get'   { 'bandHost' }
         'run'   { 'bandIdent' }
-        'info'  { 'warn' }
-        'warn'  { 'bandDeploy' }
+        'info'  { 'yellow' }
+        'warn'  { 'warn' }
         'o.k.'  { 'success' }
         'error' { 'danger' }
         'debug' { 'muted' }

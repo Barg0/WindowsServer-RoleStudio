@@ -45,314 +45,42 @@ $script:serverLogoMask = @(
 )
 $script:serverLogoAnsiWidth = 24
 
-# The three studio accents, dark-mode and light-mode value each, in the order the
-# studio lists its families. Kaido is the default and wins unless its hue collides
-# with the console background.
-$script:markAccents = @(
-    [pscustomobject]@{ Family = "kaido"; Dark = "#7aa2f7"; Light = "#3457c4"; Console = "Cyan" },
-    [pscustomobject]@{ Family = "vitrine"; Dark = "#a78bfa"; Light = "#6d46d6"; Console = "Magenta" },
-    [pscustomobject]@{ Family = "ember"; Dark = "#e0955c"; Light = "#a85f21"; Console = "Yellow" }
-)
+# The studio's other two accent families - vitrine and ember - used to be listed here
+# and scored against the console background. The accent is pinned to Kaido now, so the
+# table has no reader; the palette in Logging.ps1 is the single source of the colours.
+# The console primitives - virtual terminal processing, the console's real background
+# and hex parsing - moved to Logging.ps1 with the palette. Logging.ps1 is the FIRST part
+# the entry script loads and Write-Log is called while the rest are still loading, so
+# anything Write-Log needs has to be defined before this file exists. They are still
+# used here; dot-sourcing puts every part in one scope.
 $script:markAccent = $null
-$script:menuConsoleType = $null
-$script:menuVtEnabled = $false
-
-function Get-MenuConsoleType {
-    # The one P/Invoke surface the console UI needs: virtual terminal processing, and
-    # the screen buffer's extended info, which is the only place the console's real
-    # background colour is written down. Added once per session and cached - a resume
-    # run dot-sources these parts a second time into a session where the type already
-    # exists, and Add-Type would throw rather than return it.
-    if ($script:menuConsoleType) { return $script:menuConsoleType }
-
-    $existing = "WsrsRoles.WsrsVtConsole" -as [type]
-    if ($existing) {
-        $script:menuConsoleType = $existing
-        return $script:menuConsoleType
-    }
-
-    try {
-        $added = Add-Type -MemberDefinition @"
-[StructLayout(LayoutKind.Sequential)]
-public struct WsrsCoord { public short X; public short Y; }
-
-[StructLayout(LayoutKind.Sequential)]
-public struct WsrsSmallRect { public short Left; public short Top; public short Right; public short Bottom; }
-
-[StructLayout(LayoutKind.Sequential)]
-public struct WsrsBufferInfoEx {
-    public int cbSize;
-    public WsrsCoord dwSize;
-    public WsrsCoord dwCursorPosition;
-    public ushort wAttributes;
-    public WsrsSmallRect srWindow;
-    public WsrsCoord dwMaximumWindowSize;
-    public ushort wPopupAttributes;
-    public bool bFullscreenSupported;
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public uint[] ColorTable;
-}
-
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern IntPtr GetStdHandle(int nStdHandle);
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern bool GetConsoleScreenBufferInfoEx(IntPtr hConsoleOutput, ref WsrsBufferInfoEx lpInfo);
-"@ -Name WsrsVtConsole -Namespace WsrsRoles -PassThru -ErrorAction Stop
-
-        $script:menuConsoleType = @($added) | Where-Object { $_.Name -eq "WsrsVtConsole" } | Select-Object -First 1
-    }
-    catch {
-        # Older hosts, or a host with no console at all: every caller falls back
-        $script:menuConsoleType = $null
-    }
-
-    return $script:menuConsoleType
-}
-
-function Enable-MenuVtProcessing {
-    # Turns on virtual terminal processing so truecolor ANSI renders on
-    # conhost-based Windows consoles. Safe no-op everywhere else.
-    if ($script:menuVtEnabled) { return }
-    $script:menuVtEnabled = $true
-
-    try {
-        $vt = Get-MenuConsoleType
-        if ($null -eq $vt) { return }
-        $handle = $vt::GetStdHandle(-11)
-        $mode = [uint32]0
-        if ($vt::GetConsoleMode($handle, [ref]$mode)) {
-            [void]$vt::SetConsoleMode($handle, ($mode -bor 0x4))
-        }
-    }
-    catch {
-        # Older hosts without VT support fall back to the plain ASCII logo
-    }
-}
-
-function Test-MenuAnsiSupported {
-    try {
-        if ($env:NO_COLOR) { return $false }
-        if ($Host.UI.SupportsVirtualTerminal) { return $true }
-        if ($env:WT_SESSION -or $env:TERM_PROGRAM -or $env:TERM) { return $true }
-        return $false
-    }
-    catch {
-        return $false
-    }
-}
-
-function Test-MenuHostSupported {
-    try {
-        if ($null -eq $Host -or $null -eq $Host.UI -or $null -eq $Host.UI.RawUI) { return $false }
-        if ($Host.Name -match "ISE") { return $false }
-        return $true
-    }
-    catch {
-        return $false
-    }
-}
-
-function ConvertFrom-HexColor {
-    param([string]$Hex)
-
-    $h = $Hex.TrimStart("#")
-    return @(
-        [Convert]::ToInt32($h.Substring(0, 2), 16),
-        [Convert]::ToInt32($h.Substring(2, 2), 16),
-        [Convert]::ToInt32($h.Substring(4, 2), 16)
-    )
-}
-
-function Get-ColorLuminance {
-    # WCAG relative luminance, 0 (black) to 1 (white).
-    param([int[]]$Rgb)
-
-    $parts = @()
-    foreach ($c in $Rgb) {
-        $s = $c / 255.0
-        if ($s -le 0.03928) { $parts += ($s / 12.92) }
-        else { $parts += [Math]::Pow((($s + 0.055) / 1.055), 2.4) }
-    }
-    return (0.2126 * $parts[0]) + (0.7152 * $parts[1]) + (0.0722 * $parts[2])
-}
-
-function Get-ColorContrast {
-    param([int[]]$First, [int[]]$Second)
-
-    $a = Get-ColorLuminance -Rgb $First
-    $b = Get-ColorLuminance -Rgb $Second
-    if ($a -lt $b) { $t = $a; $a = $b; $b = $t }
-    return (($a + 0.05) / ($b + 0.05))
-}
-
-function Get-ColorHue {
-    # HSL hue in degrees. Meaningless for a grey, which is what Get-ColorChroma
-    # is checked for first.
-    param([int[]]$Rgb)
-
-    $r = $Rgb[0] / 255.0; $g = $Rgb[1] / 255.0; $b = $Rgb[2] / 255.0
-    $max = [Math]::Max($r, [Math]::Max($g, $b))
-    $min = [Math]::Min($r, [Math]::Min($g, $b))
-    $d = $max - $min
-    if ($d -eq 0) { return 0.0 }
-
-    if ($max -eq $r) { $h = 60.0 * ((($g - $b) / $d) % 6.0) }
-    elseif ($max -eq $g) { $h = 60.0 * ((($b - $r) / $d) + 2.0) }
-    else { $h = 60.0 * ((($r - $g) / $d) + 4.0) }
-    if ($h -lt 0) { $h += 360.0 }
-    return $h
-}
-
-function Get-ColorChroma {
-    # Absolute chroma, 0 to 1. Deliberately not HSL saturation: the studio's own dark
-    # background is #16171e, whose eight-step spread between channels is invisible and
-    # yet scores 0.15 saturation once HSL divides it by a near-zero lightness term.
-    # A background this close to black has no hue worth avoiding.
-    param([int[]]$Rgb)
-
-    $max = [Math]::Max($Rgb[0], [Math]::Max($Rgb[1], $Rgb[2]))
-    $min = [Math]::Min($Rgb[0], [Math]::Min($Rgb[1], $Rgb[2]))
-    return (($max - $min) / 255.0)
-}
-
-function Get-ColorHueDistance {
-    # 0 to 180: how far apart two hues are on the wheel.
-    param([double]$First, [double]$Second)
-
-    $d = [Math]::Abs($First - $Second)
-    if ($d -gt 180.0) { $d = 360.0 - $d }
-    return $d
-}
-
-# The legacy console palette, used only when GetConsoleScreenBufferInfoEx could not
-# answer. One entry is not the legacy value: **DarkMagenta as a background is the
-# PowerShell 5.1 shortcut's #012456**, not purple. That shortcut remaps the palette
-# slot rather than the colour name, so every stock Windows PowerShell console on a
-# server reports DarkMagenta and paints navy - and nothing else sets a genuinely
-# magenta console background by accident.
-$script:consoleColorRgb = @{
-    "Black"       = "#0c0c0c"; "DarkBlue" = "#000080"; "DarkGreen" = "#008000"
-    "DarkCyan"    = "#008080"; "DarkRed" = "#800000"; "DarkMagenta" = "#012456"
-    "DarkYellow"  = "#808000"; "Gray" = "#c0c0c0"; "DarkGray" = "#808080"
-    "Blue"        = "#0000ff"; "Green" = "#00ff00"; "Cyan" = "#00ffff"
-    "Red"         = "#ff0000"; "Magenta" = "#ff00ff"; "Yellow" = "#ffff00"
-    "White"       = "#ffffff"
-}
-
-function Get-ConsoleBackgroundRgb {
-    # The console's real background colour, or $null when nothing can answer.
-    #
-    # GetConsoleScreenBufferInfoEx is the only exact source: it hands back the live
-    # 16-entry colour table plus the current attribute, so a remapped palette (the
-    # PowerShell shortcut), a Windows Terminal scheme and a hand-set background all
-    # read correctly. The RawUI fall-back below only knows a colour *name*.
-    try {
-        $vt = Get-MenuConsoleType
-        if ($vt) {
-            $infoType = $vt.GetNestedType("WsrsBufferInfoEx")
-            if ($infoType) {
-                $info = [Activator]::CreateInstance($infoType)
-                $info.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($infoType)
-                $handle = $vt::GetStdHandle(-11)
-                if ($vt::GetConsoleScreenBufferInfoEx($handle, [ref]$info)) {
-                    $index = ([int]$info.wAttributes -shr 4) -band 0xF
-                    $ref = [uint32]$info.ColorTable[$index]
-                    # COLORREF is 0x00BBGGRR
-                    return @(
-                        [int]($ref -band 0xFF),
-                        [int](($ref -shr 8) -band 0xFF),
-                        [int](($ref -shr 16) -band 0xFF)
-                    )
-                }
-            }
-        }
-    }
-    catch {
-        # No console, no kernel32, or a host that does not own a screen buffer
-    }
-
-    try {
-        $name = [string]$Host.UI.RawUI.BackgroundColor
-        if ($script:consoleColorRgb.ContainsKey($name)) {
-            return (ConvertFrom-HexColor -Hex $script:consoleColorRgb[$name])
-        }
-    }
-    catch {
-        # RawUI is absent in a host with no console
-    }
-
-    return $null
-}
 
 function Get-MarkAccent {
-    # Which colour the mark is drawn in, decided against the console background.
+    # PINNED to Kaido, the studio's default theme. This used to score the three studio
+    # accents against the console's real background and keep the brand "unless it
+    # collides" - Ember on the stock PowerShell blue, a flat neutral on a mid-tone
+    # background. That rule is gone by decision: this project has one look, the studio
+    # is Kaido Dark and a run should be the same colours as the design that produced it
+    # rather than a colour picked at run time.
     #
-    # The rule is "keep the brand unless it collides": Kaido - the studio's default
-    # accent - is used whenever it is legible and its hue is clear of the background.
-    # It is not clear of #012456, which is why the stock PowerShell console gets
-    # Ember instead: same 6:1 contrast, 193 degrees of hue away, so it reads as a
-    # mark rather than as a lighter patch of background. A background too close to
-    # every accent at once drops the mark to a flat neutral, which always separates.
+    # What was given up, stated rather than discovered: on a console with a LIGHT
+    # background #7aa2f7 has poor contrast, and the mark and the accent both suffer.
+    # The named-colour fallback in Write-Studio is the only remaining safety net, and it
+    # only applies to a console with no virtual terminal processing at all. If a light
+    # console ever has to be supported, this is the function to reopen - the scoring it
+    # replaced is in the history.
     if ($script:markAccent) { return $script:markAccent }
 
-    $bg = Get-ConsoleBackgroundRgb
-    if ($null -eq $bg) { $bg = ConvertFrom-HexColor -Hex "#0c0c0c" }
-
-    $bgLum = Get-ColorLuminance -Rgb $bg
-    $bgHue = Get-ColorHue -Rgb $bg
-    $achromatic = (Get-ColorChroma -Rgb $bg) -lt 0.10
-    $mode = "Dark"
-    if ($bgLum -gt 0.35) { $mode = "Light" }
-
-    $scored = @()
-    foreach ($accent in $script:markAccents) {
-        $rgb = ConvertFrom-HexColor -Hex $accent.$mode
-        $contrast = Get-ColorContrast -First $rgb -Second $bg
-        $hueGap = 180.0
-        if (-not $achromatic) { $hueGap = Get-ColorHueDistance -First (Get-ColorHue -Rgb $rgb) -Second $bgHue }
-        $score = (($hueGap / 180.0) * 0.6) + (([Math]::Min($contrast, 10.0) / 10.0) * 0.4)
-        if ($contrast -lt 4.5) { $score -= 1.0 }
-        $scored += [pscustomobject]@{
-            Family   = $accent.Family
-            Console  = $accent.Console
-            Hex      = $accent.$mode
-            Rgb      = $rgb
-            Contrast = $contrast
-            HueGap   = $hueGap
-            Score    = $score
-        }
+    $hex = $script:studioPalette["accent"]
+    $script:markAccent = [pscustomobject]@{
+        Family   = "kaido"
+        Console  = $script:studioFallback["accent"]
+        Hex      = $hex
+        Rgb      = (ConvertFrom-HexColor -Hex $hex)
+        Contrast = 0.0
+        HueGap   = 180.0
+        Score    = 1.0
     }
-
-    $chosen = $scored | Where-Object { $_.Family -eq "kaido" } | Select-Object -First 1
-    if ($chosen.Contrast -lt 4.5 -or $chosen.HueGap -lt 60.0) {
-        $chosen = $scored | Sort-Object -Property Score -Descending | Select-Object -First 1
-    }
-
-    if ($chosen.Contrast -lt 3.0) {
-        # Nothing in the palette separates - a mid-tone or a saturated background.
-        # Fall to a flat neutral, and pick which one by contrast rather than by the
-        # mode: a mid grey is neither dark nor light, and near-black beats near-white
-        # on it by a full contrast step.
-        $chosen = @("#e8ecf5", "#16171e") | ForEach-Object {
-            $neutralConsole = "White"
-            if ($_ -eq "#16171e") { $neutralConsole = "Black" }
-            $neutralRgb = ConvertFrom-HexColor -Hex $_
-            [pscustomobject]@{
-                Family   = "neutral"
-                Console  = $neutralConsole
-                Hex      = $_
-                Rgb      = $neutralRgb
-                Contrast = (Get-ColorContrast -First $neutralRgb -Second $bg)
-                HueGap   = 0.0
-                Score    = 0.0
-            }
-        } | Sort-Object -Property Contrast -Descending | Select-Object -First 1
-    }
-
-    $script:markAccent = $chosen
     return $script:markAccent
 }
 
@@ -383,6 +111,10 @@ function Get-ServerLogoLine {
 
 function Write-ColoredLogoLine {
     # The no-ANSI path: the same mask in the nearest of the sixteen console colours.
+    # The one write in this project that does NOT go through Write-Studio, and it is
+    # this one because it is already the fallback: Write-Studio's job is to choose
+    # between truecolor and a named colour, and this function is only ever called when
+    # that choice has already been made and come out the other way.
     param([string]$Line)
 
     Write-Host $Line -NoNewline -ForegroundColor (Get-MarkAccent).Console
@@ -420,9 +152,9 @@ function Write-FastfetchInfoRow {
 
     if ($IndentWidth -gt 0) { Write-Host (" " * $IndentWidth) -NoNewline }
     $paddedLabel = ("{0,-$LabelWidth}" -f $Label)
-    Write-Host $paddedLabel -NoNewline -ForegroundColor DarkCyan
-    Write-Host ": " -NoNewline -ForegroundColor DarkCyan
-    Write-Host $Value -ForegroundColor Gray
+    Write-Studio -Text $paddedLabel -Key "accent" -NoNewline
+    Write-Studio -Text ": " -Key "accent" -NoNewline
+    Write-Studio -Text $Value -Key "fg"
 }
 
 function Show-MenuHeader {
@@ -493,7 +225,7 @@ function Show-MenuHeader {
                 Write-Host ""
                 continue
             }
-            if ($row.Accent) { Write-Host $row.Value -ForegroundColor White }
+            if ($row.Accent) { Write-Studio -Text $row.Value -Key "accent" }
             else { Write-FastfetchInfoRow -Label $row.Label -Value $row.Value -LabelWidth $labelWidth }
         }
         else {
@@ -502,7 +234,7 @@ function Show-MenuHeader {
     }
 
     Write-Host ""
-    Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
+    Write-Studio -Text ("  " + ("-" * 62)) -Key "muted"
     Write-Host ""
 }
 
@@ -549,9 +281,9 @@ function Show-Menu {
         if ($PreItems) { & $PreItems }
 
         if (-not [string]::IsNullOrWhiteSpace($Heading)) {
-            Write-Host "  $Heading" -ForegroundColor White
+            Write-Studio -Text "  $Heading" -Key "fg"
             if (-not [string]::IsNullOrWhiteSpace($HeadingHint)) {
-                Write-Host "  $HeadingHint" -ForegroundColor DarkGray
+                Write-Studio -Text "  $HeadingHint" -Key "muted"
             }
             Write-Host ""
         }
@@ -561,25 +293,25 @@ function Show-Menu {
             $label = if ($item.Label) { [string]$item.Label } else { [string]$item }
 
             if ($i -eq $index) {
-                Write-Host "  > " -NoNewline -ForegroundColor Cyan
-                Write-Host $label -ForegroundColor White
+                Write-Studio -Text "  > " -Key "accent" -NoNewline
+                Write-Studio -Text $label -Key "fg"
             }
             else {
                 Write-Host "    " -NoNewline
-                Write-Host $label -ForegroundColor Gray
+                Write-Studio -Text $label -Key "fg"
             }
             foreach ($line in @(Get-MenuDetailLine -Item $item)) {
-                Write-Host ("      " + $line) -ForegroundColor DarkGray
+                Write-Studio -Text ("      " + $line) -Key "muted"
             }
         }
 
         Write-Host ""
-        Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
+        Write-Studio -Text ("  " + ("-" * 62)) -Key "muted"
         if ($useRawUi) {
-            Write-Host "  Up/Down move   Enter select   Esc/Q cancel" -ForegroundColor DarkGray
+            Write-Studio -Text "  Up/Down move   Enter select   Esc/Q cancel" -Key "muted"
         }
         else {
-            Write-Host "  Enter number + Enter   (Q to cancel)" -ForegroundColor DarkGray
+            Write-Studio -Text "  Enter number + Enter   (Q to cancel)" -Key "muted"
         }
         Write-Host ""
 
@@ -654,9 +386,9 @@ function Show-MultiSelectMenu {
         if ($PreItems) { & $PreItems }
 
         if (-not [string]::IsNullOrWhiteSpace($Heading)) {
-            Write-Host "  $Heading" -ForegroundColor White
+            Write-Studio -Text "  $Heading" -Key "fg"
             if (-not [string]::IsNullOrWhiteSpace($HeadingHint)) {
-                Write-Host "  $HeadingHint" -ForegroundColor DarkGray
+                Write-Studio -Text "  $HeadingHint" -Key "muted"
             }
             Write-Host ""
         }
@@ -669,33 +401,33 @@ function Show-MultiSelectMenu {
             if (-not $useRawUi) { $number = "{0,2}. " -f ($i + 1) }
 
             if ($i -eq $index) {
-                Write-Host "  > " -NoNewline -ForegroundColor Cyan
-                Write-Host ($number + $mark + $label) -ForegroundColor White
+                Write-Studio -Text "  > " -Key "accent" -NoNewline
+                Write-Studio -Text ($number + $mark + $label) -Key "fg"
             }
             else {
                 Write-Host "    " -NoNewline
                 if ($selected.Contains([string]$item.Id)) {
-                    Write-Host ($number + $mark + $label) -ForegroundColor Cyan
+                    Write-Studio -Text ($number + $mark + $label) -Key "accent"
                 }
                 else {
-                    Write-Host ($number + $mark + $label) -ForegroundColor Gray
+                    Write-Studio -Text ($number + $mark + $label) -Key "fg"
                 }
             }
             # Indented past the tick box and the number, so the detail hangs under the
             # label rather than under the margin.
             foreach ($line in @(Get-MenuDetailLine -Item $item)) {
-                Write-Host ((" " * (4 + $number.Length + $mark.Length)) + $line) -ForegroundColor DarkGray
+                Write-Studio -Text ((" " * (4 + $number.Length + $mark.Length)) + $line) -Key "muted"
             }
         }
 
         Write-Host ""
-        Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
-        Write-Host ("  {0} of {1} selected" -f $selected.Count, $Items.Count) -ForegroundColor DarkGray
+        Write-Studio -Text ("  " + ("-" * 62)) -Key "muted"
+        Write-Studio -Text ("  {0} of {1} selected" -f $selected.Count, $Items.Count) -Key "muted"
         if ($useRawUi) {
-            Write-Host "  Up/Down move   Space tick   A all/none   Enter confirm   Esc/Q cancel" -ForegroundColor DarkGray
+            Write-Studio -Text "  Up/Down move   Space tick   A all/none   Enter confirm   Esc/Q cancel" -Key "muted"
         }
         else {
-            Write-Host "  Numbers to tick (1,3,4)   A all/none   Enter confirm   Q cancel" -ForegroundColor DarkGray
+            Write-Studio -Text "  Numbers to tick (1,3,4)   A all/none   Enter confirm   Q cancel" -Key "muted"
         }
         Write-Host ""
 
@@ -776,7 +508,7 @@ function Write-SummarySection {
     param([Parameter(Mandatory)][string]$Title)
 
     Write-Host ""
-    Write-Host "  $Title" -ForegroundColor White
+    Write-Studio -Text "  $Title" -Key "fg"
 }
 
 function Show-AddsSummary {
@@ -829,7 +561,7 @@ function Show-AddsSummary {
         Write-FastfetchInfoRow -Label "ipv6 client" -Value $value -LabelWidth 24 -IndentWidth 2
     }
 
-    Write-Host "    the server restarts when the promotion finishes" -ForegroundColor DarkGray
+    Write-Studio -Text "    the server restarts when the promotion finishes" -Key "muted"
 }
 
 function Show-DnsSummary {
@@ -861,13 +593,66 @@ function Show-DnsSummary {
     Write-FastfetchInfoRow -Label "scavenging" -Value $scavengingText -LabelWidth 24 -IndentWidth 2
 }
 
+# The PKCS mode of the connector tier. Every row here is something that mode actually
+# has; the NDES rows below would all read '?' or, worse, describe a service that is not
+# installed on this server.
+function Show-PkcsSummary {
+    param(
+        [Parameter(Mandatory)][object]$CertificateServices,
+        # Not mandatory, and null is handled below. This screen exists to tell somebody
+        # what is about to happen; it must never be the reason nothing happens. The
+        # same rule the logging code follows - see PSAvoidUsingEmptyCatchBlock in
+        # CLAUDE.md - applied to the part of the run that only ever describes.
+        [object]$Connector
+    )
+
+    if ($null -eq $Connector) {
+        Write-SummarySection -Title "Certificate Services"
+        Write-FastfetchInfoRow -Label "this server is" -Value "Intune Certificate Connector host (PKCS)" -LabelWidth 24 -IndentWidth 2
+        Write-FastfetchInfoRow -Label "config" -Value "carries no connector section this run can read" -LabelWidth 24 -IndentWidth 2
+        return
+    }
+
+    Write-SummarySection -Title "Certificate Services"
+    Write-FastfetchInfoRow -Label "this server is" -Value "Intune Certificate Connector host (PKCS)" -LabelWidth 24 -IndentWidth 2
+    Write-FastfetchInfoRow -Label "installs" -Value "Nothing - the connector reaches the CA over RPC" -LabelWidth 24 -IndentWidth 2
+
+    $issuingTier = Get-ConfigValue -InputObject $CertificateServices -Name "issuing"
+    Write-FastfetchInfoRow -Label "enrolls against" -Value ([string](Get-ConfigText -InputObject $issuingTier -Name "caCommonName" -Default "?")) -LabelWidth 24 -IndentWidth 2
+
+    $templateNames = @(Get-AdcsPkcsTemplateName -Connector $Connector)
+    $templateText = if ($templateNames.Count -eq 0) { "none - a profile has nothing to ask for" } else { $templateNames -join ", " }
+    Write-FastfetchInfoRow -Label "templates" -Value $templateText -LabelWidth 24 -IndentWidth 2
+
+    $groupName = Get-AdcsPkcsGroupName -Connector $Connector
+    if (-not [string]::IsNullOrWhiteSpace($groupName)) {
+        Write-FastfetchInfoRow -Label "enrolls through" -Value $groupName -LabelWidth 24 -IndentWidth 2
+    }
+    # SYSTEM is the design's answer and the installer's default, so the identity that
+    # reaches the CA is this machine. Stated because it is the one thing people get
+    # wrong when they grant the permissions by hand.
+    Write-FastfetchInfoRow -Label "connector runs as" -Value "SYSTEM - reaches the CA as this machine's computer account" -LabelWidth 24 -IndentWidth 2
+
+    $revocation = [bool](Get-ConfigValue -InputObject $Connector -Name "grantRevocation" -Default $true)
+    Write-FastfetchInfoRow -Label "revocation" -Value $(if ($revocation) { "Issue and Manage Certificates on the CA" } else { "not granted - Intune cannot revoke" }) -LabelWidth 24 -IndentWidth 2
+
+    $sid = [bool](Get-ConfigValue -InputObject $Connector -Name "sidExtension" -Default $true)
+    Write-FastfetchInfoRow -Label "SID extension" -Value $(if ($sid) { "EnableSidSecurityExtension = 1, services restarted" } else { "off - certificates carry no SID" }) -LabelWidth 24 -IndentWidth 2
+    Write-FastfetchInfoRow -Label "stays manual" -Value "The connector install - an interactive Entra sign-in" -LabelWidth 24 -IndentWidth 2
+}
+
 function Show-AdcsSummary {
     param([object]$CertificateServices)
 
     $tierName = Resolve-AdcsTier -CertificateServices $CertificateServices
     if ([string]::IsNullOrWhiteSpace($tierName)) { return }
 
-    $tier = Get-ConfigValue -InputObject $CertificateServices -Name $tierName
+    # Through the resolver, never by raw name: the connector tier is written as
+    # `intuneConnector` and only falls back to `scep`, so reading the tier name straight
+    # out of the config returned null for every new document - which is how the review
+    # screen threw a ParameterBindingValidationException in front of the run plan.
+    $tier = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName $tierName
+    if ($null -eq $tier) { return }
     $shared = Get-ConfigValue -InputObject $CertificateServices -Name "shared"
 
     # The directory tier has no CA, no key and no CRL, so the rows below would all read
@@ -924,6 +709,12 @@ function Show-AdcsSummary {
     # The SCEP tier is the fourth machine: no CA of its own, so the key and CRL rows
     # would all read '?'. It gets the facts NDES is about instead.
     if ($tierName -eq "scep") {
+        # PKCS mode shares the machine and none of the rows below it - no service
+        # account, no published name, no DNS record, no certificate of its own.
+        if ((Get-AdcsConnectorMode -CertificateServices $CertificateServices) -eq "pkcs") {
+            Show-PkcsSummary -CertificateServices $CertificateServices -Connector $tier
+            return
+        }
         Write-SummarySection -Title "Certificate Services"
         Write-FastfetchInfoRow -Label "this server is" -Value "Intune Certificate Connector host (NDES)" -LabelWidth 24 -IndentWidth 2
         $account = Get-ConfigValue -InputObject $tier -Name "serviceAccount"
@@ -966,7 +757,7 @@ function Show-AdcsSummary {
         }
 
         Write-FastfetchInfoRow -Label "installs" -Value "AD CS with NDES, IIS and its role services, the .NET features" -LabelWidth 24 -IndentWidth 2
-        Write-Host "    the Intune connector itself stays a manual install - an interactive Entra sign-in, no unattended path" -ForegroundColor DarkGray
+        Write-Studio -Text "    the Intune connector itself stays a manual install - an interactive Entra sign-in, no unattended path" -Key "muted"
         return
     }
 
@@ -1039,7 +830,7 @@ function Show-AdcsSummary {
         }
     }
     else {
-        Write-Host "    this server should be offline and powered down between ceremonies" -ForegroundColor DarkGray
+        Write-Studio -Text "    this server should be offline and powered down between ceremonies" -Key "muted"
     }
 }
 
@@ -1213,7 +1004,7 @@ function Show-RdsSummary {
         }
         Write-FastfetchInfoRow -Label "publishes" -Value ($names -join ", ") -LabelWidth 24 -IndentWidth 2
         if ([bool](Get-ConfigValue -InputObject $remoteApps -Name "showDesktopInPortal" -Default $false)) {
-            Write-Host "    the full desktop stays on the portal beside them (ShowInPortal, re-applied every run)" -ForegroundColor DarkGray
+            Write-Studio -Text "    the full desktop stays on the portal beside them (ShowInPortal, re-applied every run)" -Key "muted"
 
             $watchdog = Get-ConfigValue -InputObject $remoteApps -Name "portalWatchdog"
             if ([bool](Get-ConfigValue -InputObject $watchdog -Name "enabled" -Default $false)) {
@@ -1233,11 +1024,11 @@ function Show-RdsSummary {
                 }
             }
             else {
-                Write-Host "    nothing re-asserts it between runs - Windows clears it on every broker restart" -ForegroundColor DarkGray
+                Write-Studio -Text "    nothing re-asserts it between runs - Windows clears it on every broker restart" -Key "muted"
             }
         }
         else {
-            Write-Host "    publishing applications takes the full desktop off this collection's feed" -ForegroundColor DarkGray
+            Write-Studio -Text "    publishing applications takes the full desktop off this collection's feed" -Key "muted"
         }
     }
 }
@@ -1281,7 +1072,7 @@ function Show-ArcSummary {
         Write-FastfetchInfoRow -Label "agent proxy" -Value $proxyUrl -LabelWidth 24 -IndentWidth 2
     }
 
-    Write-Host "    tags are set while connecting - afterwards they belong to the Azure resource" -ForegroundColor DarkGray
+    Write-Studio -Text "    tags are set while connecting - afterwards they belong to the Azure resource" -Key "muted"
 }
 
 # The guest cluster half of the file server summary. Silent on a single-host design -
@@ -1422,8 +1213,8 @@ function Show-FsSummary {
     if ($fsLinks.Count -gt 0) { $fsLinkText = $fsLinks -join ", " }
     Write-FastfetchInfoRow -Label "drive-map policies" -Value $fsLinkText -LabelWidth 24 -IndentWidth 2
 
-    Write-Host "    on a domain controller this run creates the share groups as domain local security groups, with their members;" -ForegroundColor DarkGray
-    Write-Host "    on the file server they are a prerequisite" -ForegroundColor DarkGray
+    Write-Studio -Text "    on a domain controller this run creates the share groups as domain local security groups, with their members;" -Key "muted"
+    Write-Studio -Text "    on the file server they are a prerequisite" -Key "muted"
 }
 
 function Show-PrintSummary {
@@ -1498,7 +1289,7 @@ function Show-PrintSummary {
     if ($printLinks.Count -gt 0) { $printLinkText = $printLinks -join ", " }
     Write-FastfetchInfoRow -Label "deployment policies" -Value $printLinkText -LabelWidth 24 -IndentWidth 2
 
-    Write-Host "    on a domain controller this run creates the groups, members and the deployment GPOs; on the print server they are a prerequisite" -ForegroundColor DarkGray
+    Write-Studio -Text "    on a domain controller this run creates the groups, members and the deployment GPOs; on the print server they are a prerequisite" -Key "muted"
 }
 
 function Show-DhcpSummary {
@@ -1531,7 +1322,7 @@ function Show-DhcpSummary {
             $detail = "hot standby, {0}% reserved" -f [int](Get-ConfigValue -InputObject $failover -Name "reservePercent" -Default 5)
         }
         Write-FastfetchInfoRow -Label "relationship" -Value $detail -LabelWidth 24 -IndentWidth 2
-        Write-Host "    the scopes come from the partner - a failover relationship replicates them" -ForegroundColor DarkGray
+        Write-Studio -Text "    the scopes come from the partner - a failover relationship replicates them" -Key "muted"
         return
     }
 
@@ -1571,13 +1362,13 @@ function Show-ConnectorSummary {
             Write-FastfetchInfoRow -Label "re-register" -Value "Yes - renews the trust certificate" -LabelWidth 24 -IndentWidth 2
         }
         if ($registration -eq "tokenFile") {
-            Write-Host "    mint the token with -Task ConnectorToken on a machine with a browser, then copy it here" -ForegroundColor DarkGray
+            Write-Studio -Text "    mint the token with -Task ConnectorToken on a machine with a browser, then copy it here" -Key "muted"
         }
         else {
-            Write-Host "    this server prints a URL and a code - sign in on any device to finish the registration" -ForegroundColor DarkGray
+            Write-Studio -Text "    this server prints a URL and a code - sign in on any device to finish the registration" -Key "muted"
         }
     }
-    Write-Host "    Conditional Access must allow the device code flow and authentication transfer, or registration fails" -ForegroundColor DarkGray
+    Write-Studio -Text "    Conditional Access must allow the device code flow and authentication transfer, or registration fails" -Key "muted"
 }
 
 # The two-node S2D mode's half of the summary - its own function because the two modes
@@ -1833,7 +1624,7 @@ function Show-ExchangeSummary {
     }
 
     if (-not (Test-ExchangeInstalled)) {
-        Write-Host "    the install runs from the ISO in isos\ and takes the better part of an hour, then one reboot" -ForegroundColor DarkGray
+        Write-Studio -Text "    the install runs from the ISO in isos\ and takes the better part of an hour, then one reboot" -Key "muted"
     }
 }
 
@@ -1845,7 +1636,7 @@ function Show-RunSummary {
         [Parameter(Mandatory)][string]$ConfigFilePath
     )
 
-    Write-Host "  Source" -ForegroundColor White
+    Write-Studio -Text "  Source" -Key "fg"
     Write-FastfetchInfoRow -Label "config" -Value $ConfigFilePath -LabelWidth 24 -IndentWidth 2
     Write-FastfetchInfoRow -Label "this machine" -Value ([string]$env:COMPUTERNAME) -LabelWidth 24 -IndentWidth 2
 
@@ -1874,7 +1665,7 @@ function Show-RunSummary {
     }
 
     Write-Host ""
-    Write-Host ("  " + ("-" * 62)) -ForegroundColor DarkGray
+    Write-Studio -Text ("  " + ("-" * 62)) -Key "muted"
     Write-Host ""
 }
 

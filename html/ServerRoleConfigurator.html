@@ -2212,6 +2212,16 @@ const BUILTIN_TEMPLATE_NAMES = [
   "SubCA", "User", "UserSignature", "WebServer", "Workstation"
 ];
 
+/* The one group every PKCS template is enrolled through, and the one the CA names.
+   It is a single group rather than one per template on purpose: Microsoft's rule is
+   that any PKCS-capable connector can pick up any request off the shared Intune
+   queue, so every connector in a tenant has to hold the SAME permissions - a
+   per-template group would be modelling a distinction that cannot exist. Plural
+   because the membership grows: the second connector somebody installs is one
+   group-add away from working. The "AD CS - " prefix rather than "Certificate - "
+   because this group holds rights on the CA itself as well as on the templates. */
+const PKCS_CONNECTOR_GROUP = "AD CS - Intune Certificate Connectors";
+
 const TEMPLATE_CATALOG = [
   {
     id: "domainControllerKerberos",
@@ -2574,6 +2584,113 @@ const TEMPLATE_CATALOG = [
     preferredValidityDays: 90,
     requireManagerApproval: false,
     warning: "Same guarded exception as the other SCEP template: the subject comes from the request and the Intune policy module is the control. Two more things this design cannot do for you - configure <strong>Windows Hello for Business from Intune</strong> (deploying this certificate by Intune while WHfB comes from group policy makes enrollment fail with <code>0x82ab0011</code>, and nothing on the CA side will show it), and give Microsoft Entra joined clients a domain controller certificate to check, which is the root of trust that stops them talking to a rogue DC."
+  },
+  {
+    id: "intunePkcs",
+    /* The SCEP template's twin, named the same way and for the same reason - after the
+       EKU. The two differ by the connector feature that reaches them, not by what the
+       certificate is for, so "PKCS" where the other says "SCEP" and nothing else moves. */
+    displayName: "PKCS Client Authentication",
+    /* Ticked by the connector tier in PKCS mode, not by hand. */
+    defaultEnabled: false,
+    sourceTemplate: "WebServer",
+    sourceLabel: "Web Server",
+    purpose: "What the Intune Certificate Connector enrolls on behalf of a PKCS profile - the template behind every certificate that profile deploys.",
+    note: "Two things separate this from its SCEP twin. The <strong>private key is made on the connector server</strong>, not on the device: the connector enrolls, exports a PKCS#12 and hands it to Intune, so the template <em>must</em> allow the key to be exported or nothing is ever issued. There is no switch for that here - a PKCS template without it is not a design decision, it is a broken one. And the <strong>template name is named by the profile</strong>, which is the field a SCEP profile does not have: what goes into <em>Certificate template name</em> is the name minus its spaces - <code>PKCSClientAuthentication</code> - and not the display name above it. The subject still comes from the request, because the device is not in the directory and there is nothing to build one from. Publication into the directory is off: the PKCS guide has deselecting it as a numbered step, and an authentication certificate in a user object is a list of everything this template ever issued for anyone who can read it.",
+    fixedPrincipals: [],
+    /* Three months, the same answer and the same reasoning as the SCEP twin: a profile
+       re-issues rather than a person renewing, so the lifetime is a blast radius. */
+    preferredValidityDays: 90,
+    /* One principal, and it is a machine. The connector installed as SYSTEM - the
+       installer's default and this design's choice - reaches the CA as the connector
+       host's computer account, which is what Microsoft's own "Denied by Policy Module"
+       fix grants Read and Enroll to. */
+    suggestedGroup: {
+      mode: "enroll",
+      description: "The Intune Certificate Connector's computer account - the only principal that enrolls PKCS requests"
+    },
+    /* Fixed, not derived from the display name: both PKCS templates share one group.
+       See PKCS_CONNECTOR_GROUP. */
+    fixedGroup: PKCS_CONNECTOR_GROUP,
+    supersedeTemplates: [],
+    unpublishSuperseded: false,
+    enrolleeSuppliesSubject: true,
+    /* True and not offered: exportChoice is absent, so the card shows no toggle and
+       this stays as seeded. The connector cannot produce a PKCS#12 from a key it
+       cannot export. */
+    allowPrivateKeyExport: true,
+    extendedKeyUsage: ["1.3.6.1.5.5.7.3.2"],
+    /* The pair the validation reads, the PKCS half of it: the supply-the-subject error
+       becomes the documented exception, and the exception's justification is different
+       from the SCEP one - there is no policy module and no signed challenge here, so
+       the enrollment ACL is the entire control. */
+    pkcsTemplate: true,
+    /* Signature and encipherment both, stated rather than inherited - and in this mode
+       the template is the ONLY thing that states it. A PKCS profile has no key usage
+       field at all, so nothing downstream can correct a template that carries the
+       wrong pair; it simply issues the wrong certificate. */
+    keyUsage: "signatureAndEncryption",
+    intuneProfile: {
+      certificateType: "Device, or User - both reach this template",
+      keyStorageProvider: "Enroll to TPM KSP if present, otherwise Software KSP",
+      subjectName: "CN={{AzureADDeviceId}} for a device, CN={{UserPrincipalName}} for a user",
+      subjectAltName: "UPN = {{UserPrincipalName}} for a user profile; none is required for a device",
+      sanWhy: "The SID that strong mapping needs does NOT come from here in this mode - the connector writes it as a real certificate extension, from the registry value on the connector server. Putting {{OnPremisesSecurityIdentifier}} in a URI here is the SCEP answer and does nothing for PKCS."
+    },
+    /* Windows Server 2016, schema 4, pinned for the same reason as its SCEP twin:
+       below schema 3 there is no Key Storage Provider and no per-template hash. The
+       PKCS guide says Windows Server 2008 R2, which is a floor and not a ceiling. */
+    compatibilityLevel: "WindowsServer2016",
+    requireManagerApproval: false,
+    warning: "This template is only safe <strong>narrow</strong>. The subject comes from the request, the EKU is Client Authentication and the private key is exportable - the shape the studio refuses everywhere else - and unlike the SCEP templates there is no policy module and no signed challenge sitting behind it. The <strong>enrollment ACL is the entire control</strong>: exactly one group, holding exactly the connector's computer account, with Domain Users removed. Never put manager approval on it - the connector cannot complete a pending request, so the profile waits for ever and the certificate is simply never issued."
+  },
+  {
+    id: "whfbRdpSignInPkcs",
+    displayName: "PKCS Windows Hello",
+    defaultEnabled: false,
+    /* Smartcard Logon, exactly as the SCEP twin - Windows Hello for Business emulates
+       a smart card and this certificate is what RDP presents through the redirected
+       smart card channel. */
+    sourceTemplate: "SmartcardLogon",
+    sourceLabel: "Smartcard Logon",
+    purpose: "Signs a user in to a remote desktop with Windows Hello - the PIN or the fingerprint on their own machine unlocks a certificate the far end accepts as a smart card.",
+    note: "Microsoft's own Windows Hello RDP guidance covers both connector features and states exactly one difference for this one: <em>if you deploy certificates with a PKCS profile, select the option Allow private key to be exported</em>. Everything else is the SCEP twin - the key must be created by the <strong>Microsoft Passport Key Storage Provider</strong> or the certificate does not land in the Windows Hello container, and this design writes <code>pKIDefaultCSPs</code> directly instead of the <code>certutil -dstemplate</code> round trip the guide describes. What selects the container on the device is the profile's <strong>Key storage provider</strong> field, not this attribute: here the requester is the connector on a member server, so the provider named here is a statement about the template rather than a constraint the CA enforces. The name a profile asks for is <code>PKCSWindowsHello</code>.",
+    fixedPrincipals: [],
+    suggestedGroup: {
+      mode: "enroll",
+      description: "The Intune Certificate Connector's computer account - the only principal that enrolls PKCS requests"
+    },
+    /* Fixed, not derived from the display name: both PKCS templates share one group.
+       See PKCS_CONNECTOR_GROUP. */
+    fixedGroup: PKCS_CONNECTOR_GROUP,
+    supersedeTemplates: [],
+    unpublishSuperseded: false,
+    enrolleeSuppliesSubject: true,
+    allowPrivateKeyExport: true,
+    /* Smart Card Logon first, then Client Authentication - the two the RDP sign-in
+       profile lists, and nothing else. */
+    extendedKeyUsage: ["1.3.6.1.4.1.311.20.2.2", "1.3.6.1.5.5.7.3.2"],
+    keyStorageProvider: "Microsoft Passport Key Storage Provider",
+    /* Digital signature ONLY - Microsoft's smart card requirements are explicit, and
+       a PKCS profile has no key usage field to correct it with. */
+    keyUsage: "signature",
+    /* AT_KEYEXCHANGE. Legacy on a CNG template and stated anyway, because the same
+       requirements say a smart card logon certificate must have a key exchange
+       private key type. */
+    keySpec: 1,
+    intuneProfile: {
+      certificateType: "User",
+      keyStorageProvider: "Enroll to Windows Hello for Business, otherwise fail",
+      subjectName: "CN={{UserPrincipalName}} - or CN={{OnPrem_Distinguished_Name}} where the UPN suffix and the AD domain differ",
+      subjectAltName: "UPN = {{UserPrincipalName}}",
+      sanWhy: "The UPN is what the far end authenticates. The SID that strong mapping needs comes from the connector's registry value in this mode, not from a URI here.",
+      extendedKeyUsage: "Smart Card Logon (1.3.6.1.4.1.311.20.2.2) and Client Authentication (1.3.6.1.5.5.7.3.2)"
+    },
+    compatibilityLevel: "WindowsServer2016",
+    pkcsTemplate: true,
+    preferredValidityDays: 90,
+    requireManagerApproval: false,
+    warning: "Same narrow exception as the other PKCS template, and the same two things this design cannot do for you - configure <strong>Windows Hello for Business from Intune</strong> (deploying this certificate by Intune while WHfB comes from group policy fails enrollment with <code>0x82ab0011</code>, reported nowhere on this side), and give Microsoft Entra joined clients a domain controller certificate to check, which is the root of trust that stops them talking to a rogue DC."
   }
 ];
 
@@ -2663,16 +2780,110 @@ function scepToggleTemplate(id) {
   syncScepTemplateSelection();
 }
 
+/* ---- PKCS mode ---------------------------------------------------------------
+   There is no slot table here and no ceiling. A PKCS profile carries the template's
+   NAME, so the only question this mode asks is which of the PKCS templates the
+   design publishes - and a fourth, fifth and sixth would cost nothing, where a
+   fourth SCEP template costs a second NDES server and a second connector. */
+function scepPkcsMode() {
+  return String(state.adcs.scep.connectorMode || "scep") === "pkcs";
+}
+
+function pkcsTemplateChoices() {
+  return TEMPLATE_CATALOG.filter(function (entry) { return entry.pkcsTemplate === true; });
+}
+
+/* The selection, filtered to what the catalogue still has: a document written before
+   a template existed, or naming one that was withdrawn, must not tick a phantom. */
+function pkcsSelectedTemplateIds() {
+  const known = pkcsTemplateChoices().map(function (entry) { return entry.id; });
+  return (state.adcs.scep.pkcs.templates || []).filter(function (id) { return known.indexOf(id) !== -1; });
+}
+
+/* Resolved to the template NAME, the same way the slots are - but for a different
+   reason. A SCEP slot carries a name because the run writes it into a registry key;
+   a PKCS template carries one because a person types it into an Intune profile, and
+   what they must type is the name with its spaces removed rather than the display
+   name above it. */
+function pkcsTemplateName(id) {
+  const item = state.adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
+  if (!item) { return ""; }
+  return String(item.templateName || "").trim();
+}
+
+function pkcsToggleTemplate(id) {
+  const selected = pkcsSelectedTemplateIds();
+  const at = selected.indexOf(id);
+  if (at === -1) { selected.push(id); }
+  else { selected.splice(at, 1); }
+  state.adcs.scep.pkcs.templates = selected;
+  syncScepTemplateSelection();
+}
+
+/* The CA role groups the connector needs, as entries in the role-group list rather
+   than as a second mechanism. Two entries naming ONE group, which is legal now that
+   Set-AdcsCaSecurity ORs every role a principal is given into a single ACE:
+
+     requester          Request Certificates - without it nothing is ever issued.
+                        Normally unstated because a default CA grants it to
+                        Authenticated Users and a computer account is one - but this
+                        design can take that default away itself, and a CA tightened
+                        that far refuses the connector with an access denied that
+                        names nothing.
+     certificateManager Issue and Manage Certificates - revocation, and only that.
+
+   Nothing here is granted to the computer account directly. The account goes in the
+   group; the group is what the CA names. */
+/* The templates the connector needs, forced into the contract whatever their tick says.
+   This is the retrofit's rule generalised, and generalising it is the fix for a bug that
+   came back twice: the connector's blade owns these items, the AD CS blade does not show
+   them, and the only thing that ticks them is a reconcile - so ANY path that rebuilds
+   the item list without running that reconcile produced a contract whose connector named
+   two templates the issuing tier was not going to write. Two such paths were found and
+   fixed one at a time, which is the shape of a problem that should not be solved by
+   finding paths. Now the tick is not what decides: being selected on the connector blade
+   is, exactly as being named by a slot is in the retrofit. */
+function connectorForcedTemplateIds() {
+  if (!scepEnabled()) { return []; }
+  return scepPkcsMode() ? pkcsSelectedTemplateIds() : scepSelectedTemplateIds();
+}
+
+function pkcsConnectorRoleGroups() {
+  /* Both conditions, and the first one is the one that bit: the MODE is pkcs on every
+     new design now, so checking it alone emitted this group - and an ACE for it on the
+     CA - for designs with no connector in them at all. A group nothing is going to put
+     a member into, granted rights on somebody's CA, by a design that never mentioned a
+     connector. Field-hit 2026-09-19. */
+  if (!scepEnabled() || !scepPkcsMode()) { return []; }
+  const groups = [{
+    id: "intuneConnectorRequester", name: PKCS_CONNECTOR_GROUP, role: "requester",
+    description: "The Intune Certificate Connector - submits PKCS requests to this CA"
+  }];
+  if (state.adcs.scep.grantRevocation) {
+    groups.push({
+      id: "intuneConnectorManager", name: PKCS_CONNECTOR_GROUP, role: "certificateManager",
+      description: "The Intune Certificate Connector - revokes the certificates it issued"
+    });
+  }
+  return groups;
+}
+
 /* A template is built because a slot names it, and stops being built when no slot does.
    These items are filtered out of the AD CS template card on purpose - the SCEP blade
    owns them - so this is the only place they are ticked, and reconciling both ways
    cannot fight a decision somebody made somewhere else. */
 function syncScepTemplateSelection() {
-  const wanted = state.adcs.scep.enabled ? scepSelectedTemplateIds() : [];
+  /* Both sets are reconciled on every call, not just the active mode's: switching
+     the mode has to untick the templates the other mode had selected, or a design
+     that was SCEP for five minutes would publish its templates for ever. */
+  const on = state.adcs.scep.enabled;
+  const wanted = (on && !scepPkcsMode()) ? scepSelectedTemplateIds() : [];
+  const wantedPkcs = (on && scepPkcsMode()) ? pkcsSelectedTemplateIds() : [];
   const scepIds = scepSlotChoices().map(function (entry) { return entry.id; });
+  const pkcsIds = pkcsTemplateChoices().map(function (entry) { return entry.id; });
   state.adcs.issuing.templates.items.forEach(function (item) {
-    if (scepIds.indexOf(item.id) === -1) { return; }
-    item.enabled = wanted.indexOf(item.id) !== -1;
+    if (scepIds.indexOf(item.id) !== -1) { item.enabled = wanted.indexOf(item.id) !== -1; }
+    else if (pkcsIds.indexOf(item.id) !== -1) { item.enabled = wantedPkcs.indexOf(item.id) !== -1; }
   });
 }
 
@@ -2751,7 +2962,22 @@ const WMI_FILTER_CATALOG = {
          queries: ["SELECT * FROM Win32_OperatingSystem WHERE ProductType = 1"] },
   paw: { code: "PAW", name: "Privileged Access Workstations", aliases: ["PAW"],
          queries: ["SELECT * FROM Win32_OperatingSystem WHERE ProductType = 1",
-                   "SELECT * FROM Win32_ComputerSystem WHERE Name LIKE '[Pp][Aa][Ww]-%'"] }
+                   "SELECT * FROM Win32_ComputerSystem WHERE Name LIKE '[Pp][Aa][Ww]-%'"] },
+  /* Copied from the ActiveDirectory-ToolKit's own config\WmiFilters.json rather than
+     reasoned about, because the reasoning gets it wrong: a jump host is a CLIENT OS -
+     ProductType 1, the same as a PAW - and not a member server. The toolkit's own words
+     for why: "the neutral entry point you sign in to before jumping to a PAW, so they
+     are client OSes like a PAW - the name prefix is what separates the two". Written as
+     ProductType 3 here for one build, on the assumption that a jump host is a server.
+
+     The bracket form is a case-insensitive LIKE: WQL has no ILIKE and compares strings
+     case-sensitively, so every casing has to be spelled out.
+
+     `aliases` carries the toolkit's `previousNames`, so a domain where this filter is
+     still called `JH` resolves too. */
+  jh:  { code: "JH",  name: "Jump Hosts", aliases: ["JH"],
+         queries: ["SELECT * FROM Win32_OperatingSystem WHERE ProductType = 1",
+                   "SELECT * FROM Win32_ComputerSystem WHERE Name LIKE '[Jj][Hh]-%'"] }
 };
 
 function wmiFilterByCode(code) { return WMI_FILTER_CATALOG[code] || null; }
@@ -2894,6 +3120,8 @@ const GPO_CATALOG = [
     kind: "autoEnrollment", scope: "Clients", tag: "CL", tier: "cl", filter: "cl" },
   { id: "autoEnrollPaw", name: "C - PAW - Certificate - Auto-Enrollment",
     kind: "autoEnrollment", scope: "Privileged access workstations", tag: "PAW", tier: "paw", filter: "paw" },
+  { id: "autoEnrollJh", name: "C - JH - Certificate - Auto-Enrollment",
+    kind: "autoEnrollment", scope: "Jump hosts", tag: "JH", tier: "jh", filter: "jh" },
   { id: "rdAuthDc", name: "C - DC - Certificate - Remote Desktop Authentication",
     kind: "remoteDesktopAuthentication", scope: "Domain controllers", tag: "DC", tier: "dc", filter: "dc" },
   { id: "rdAuthMs", name: "C - MS - Certificate - Remote Desktop Authentication",
@@ -2902,7 +3130,13 @@ const GPO_CATALOG = [
     kind: "remoteDesktopAuthentication", scope: "Clients", tag: "CL", tier: "cl", filter: "cl" },
   { id: "rdAuthPaw", name: "C - PAW - Certificate - Remote Desktop Authentication",
     kind: "remoteDesktopAuthentication", scope: "Privileged access workstations", tag: "PAW",
-    tier: "paw", filter: "paw" }
+    tier: "paw", filter: "paw" },
+  /* A jump host is the RDP target this whole policy exists for - it is the one machine
+     class whose entire job is being connected to - so it gets the listener certificate
+     object as well as the auto-enrollment one. */
+  { id: "rdAuthJh", name: "C - JH - Certificate - Remote Desktop Authentication",
+    kind: "remoteDesktopAuthentication", scope: "Jump hosts", tag: "JH",
+    tier: "jh", filter: "jh" }
 ];
 
 /* The four tiers, in the order the card shows them. Name and hint are what the link
@@ -2912,7 +3146,12 @@ const GPO_TIERS = [
   { code: "dc",  label: "Domain controllers", placeholder: "OU=Domain Controllers" },
   { code: "ms",  label: "Member servers", placeholder: "OU=Servers,OU=Corp" },
   { code: "cl",  label: "Clients", placeholder: "OU=Clients,OU=Corp" },
-  { code: "paw", label: "Privileged access workstations", placeholder: "OU=PAW,OU=Tier 0" }
+  { code: "paw", label: "Privileged access workstations", placeholder: "OU=PAW,OU=Tier 0" },
+  /* A jump host is a client OS, like a PAW, and sits beside it rather than under it:
+     the PAW is what you administer the directory from, the jump host is the neutral
+     entry point you sign in to before jumping to one. The placeholder is a hint and
+     not a default - nothing in this project creates an organizational unit. */
+  { code: "jh",  label: "Jump hosts", placeholder: "OU=Jump Hosts,OU=Tier 1" }
 ];
 
 /* What each kind writes, for the screen. The script holds the same list - this one is
@@ -2986,6 +3225,7 @@ const PERIOD_UNITS = ["Hours", "Days", "Weeks", "Months", "Years"];
 /* A group is named after the template it enrolls, so the two are never out of step
    and the list reads as what it is. Only the prefix is a convention to change. */
 const DEFAULT_GROUP_PREFIX = "Certificate - ";
+
 const GROUP_SCOPES = ["Global", "Universal"];
 
 /* Everyone-in-the-domain groups. Granting enroll or autoenroll to one of these is
@@ -3740,6 +3980,25 @@ function defaultAdcs() {
 function defaultAdcsScep() {
   return {
     enabled: false,
+    /* Which connector feature this machine is built for, and the two are exclusive
+       by design rather than by Microsoft's rules - one installer can tick both. The
+       split is here because the two share almost nothing: SCEP is NDES, IIS, three
+       registry slots and a service account; PKCS is a template, a group and two ACEs
+       on the CA. A mode that tried to be both would carry every SCEP control into a
+       design that installs no web server. Same isolation rule as the S2D cluster
+       mode - own subtree, own pwsh part, and the SCEP path is never altered by it.
+
+       PKCS is the default a NEW design opens in, and the reason is what each mode
+       costs: PKCS is a template, a group and a registry value, with no ceiling on how
+       many templates it serves; SCEP is a dozen Windows features, a service account,
+       an application pool, an IIS site, an HTTPS certificate published to the
+       internet and a hard ceiling of three templates. SCEP is what you pick when
+       something needs the protocol, not where you start.
+
+       This is the default for a design somebody is STARTING. A config.json written
+       before the mode existed still reads back as scep - see applyConfigDocument,
+       where the fallback is the old behaviour and not this default. */
+    connectorMode: "pkcs",
     computerName: "",
     /* The name devices reach from outside, published through whatever reverse proxy
        or firewall the site has. NDES itself only ever answers the internal name -
@@ -3792,6 +4051,20 @@ function defaultAdcsScep() {
        has, so those are imported PKCS. SCEP has no key archival either, so an
        encryption key issued this way takes old mail with it when it is lost. */
     templates: { signature: "", encryption: "", generalPurpose: "intuneScep" },
+    /* PKCS mode. There are no slots here and no ceiling: a PKCS profile names its
+       template outright, so the only question is which of them this design publishes.
+       Both, by default - Client Authentication is the ordinary device or user
+       certificate and Windows Hello is the case the SCEP slots exist for, and neither
+       costs anything that is not used. */
+    pkcs: {
+      templates: ["intunePkcs", "whfbRdpSignInPkcs"],
+      /* The registry value on the connector host that makes the connector write the
+         SID extension KB5014754 strong mapping needs. Not set by any installer - the
+         default is off and the certificates issue happily without it, right up until
+         a domain controller refuses to authenticate one. Needs connector 6.2406.0.1001
+         or later and Windows Server 2019 or later, both checked on the machine. */
+      sidExtension: true
+    },
     /* The CA-side half of a retrofit. On by default, because doing that groundwork is
        the entire reason somebody reaches for this shape: a CA is already running and
        they want the connector beside it without hand-building an account, two groups,
@@ -6249,6 +6522,11 @@ function rdsRenewalRelevant() {
    blade shows the task card rather than sending somebody to the gateway's blade to
    find it. */
 function scepRenewalRelevant() {
+  /* PKCS mode holds no certificate at all - no IIS binding, no registration authority -
+     so there is nothing here to renew and it must not be offered as a renewal target.
+     The certificate.source field still carries its default in that mode, which is why
+     this is a mode check and not a source check. */
+  if (scepPkcsMode()) { return false; }
   return scepEnabled() && ["internalCa", "acme"].indexOf(state.adcs.scep.certificate.source) !== -1;
 }
 
@@ -6368,7 +6646,7 @@ function defaultAdcsAccess() {
     if (!entry.suggestedGroup) { return; }
     grants[entry.id] = [{
       _id: uid("grant"),
-      principal: DEFAULT_GROUP_PREFIX + entry.displayName,
+      principal: entry.fixedGroup || (DEFAULT_GROUP_PREFIX + entry.displayName),
       mode: entry.suggestedGroup.mode,
       auto: true
     }];
@@ -6394,6 +6672,9 @@ function accessGrants(templateId) {
 function derivedGroupNameFor(item) {
   const catalog = templateCatalogEntry(item.id) || {};
   if (!catalog.suggestedGroup) { return ""; }
+  /* A template that names its own group takes it whatever the prefix says - the
+     PKCS pair share one, and a name that moved with the prefix would split them. */
+  if (catalog.fixedGroup) { return catalog.fixedGroup; }
   return state.adcs.access.prefix + String(item.displayName || "").trim();
 }
 /* A grant left on auto follows the prefix and the template name, so changing either
@@ -7338,22 +7619,124 @@ function validateForestSection(error, warn) {
    PKI design when there is one and a retrofit onto somebody else's CA when there is not,
    and almost everything that can be wrong with it is wrong in both. The differences are
    named inline rather than forked into a second copy of the list. */
+/* PKCS mode. Short, because the mode is short: no slots to get wrong, no account, no
+   web server, no certificate of its own. What is left is which templates it publishes,
+   whether the group it enrolls through is actually granted anything, and the two
+   settings whose absence fails silently months later. */
+function validatePkcsSection(error, warn) {
+  const adcs = state.adcs;
+  const scep = adcs.scep;
+  const selected = pkcsSelectedTemplateIds();
+
+  if (selected.length === 0) {
+    error("Certificate Services", "No template is selected, so this connector is published nothing to enroll. A PKCS profile names its " +
+      "template, and a name that no CA publishes fails every request with <em>The requested certificate template is not supported by " +
+      "this CA</em>.", "adcs.scep.pkcs.templates");
+  }
+
+  /* Named implies built. The connector's contract carries template NAMES and the
+     issuing tier writes template ITEMS, and the two came apart once on a bench: the
+     run published four templates, none of them the connector's, and then the connector
+     reported both of its own as missing from the CA. Asserted against what is actually
+     exported rather than against the selection, because the selection is what was
+     right and the export is what was wrong. */
+  /* The same test the builder applies - ticked OR forced in - so this can never
+     disagree with the contract it is describing. It used to read the tick alone, which
+     made it fire on designs the builder was about to get right. */
+  const forced = connectorForcedTemplateIds();
+  const built = adcs.issuing.templates.items
+    .filter(function (item) {
+      const catalog = templateCatalogEntry(item.id) || {};
+      if (catalog.scepTemplate || catalog.pkcsTemplate) { return forced.indexOf(item.id) !== -1; }
+      return item.enabled || forced.indexOf(item.id) !== -1;
+    })
+    .map(function (item) { return String(item.templateName || "").trim().toLowerCase(); });
+  selected.forEach(function (id) {
+    const item = adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
+    const name = String((item || {}).templateName || "").trim();
+    if (!name || built.indexOf(name.toLowerCase()) !== -1) { return; }
+    const catalog = templateCatalogEntry(id) || {};
+    error("Certificate Services", "The connector asks for <code>" + esc(name) + "</code> but this design does not build it - " +
+      "'" + esc(catalog.displayName || id) + "' is not among the templates the issuing CA writes. The run would publish the rest, " +
+      "grant the connector its group, and then fail every profile naming that template. Switch it on again under " +
+      "<strong>Templates this connector issues</strong>.", "adcs.scep.pkcs.templates");
+  });
+
+  /* 4096 is not a stronger choice here, it is a broken one - the same rule as the SCEP
+     templates, and it bites harder because both PKCS templates can reach Windows. */
+  selected.forEach(function (id) {
+    const item = adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
+    if (!item) { return; }
+    const size = templateKeySize(item);
+    if (size <= 2048) { return; }
+    const catalog = templateCatalogEntry(id) || {};
+    const index = adcs.issuing.templates.items.indexOf(item);
+    if (id === "whfbRdpSignInPkcs") {
+      error("Certificate Services", "'" + esc(catalog.displayName) + "' asks for a " + size + "-bit key. Windows Hello for Business " +
+        "cannot store a key larger than 2048 and Microsoft states there is no workaround - every enrolment against this template fails.",
+        "adcs.issuing.templates.items." + index + ".minimalKeySize");
+    }
+    else {
+      warn("Certificate Services", "'" + esc(catalog.displayName) + "' asks for a " + size + "-bit key. On Windows a key that size can " +
+        "only live in the <strong>software</strong> KSP - the hardware TPM cannot store one - so devices that would have kept this key " +
+        "in their TPM silently keep it in a file instead.");
+    }
+  });
+
+  if (selected.indexOf("whfbRdpSignInPkcs") !== -1 && !String(adcs.shared.forestDomainName || "").trim()) {
+    warn("Certificate Services", "The Windows Hello template is selected but the design names no forest domain, so nothing here can " +
+      "check the certificate a Microsoft Entra joined client needs from a domain controller to trust it.");
+  }
+
+  /* The group is the whole control in this mode, so a design that creates it and then
+     grants it nothing is the one failure worth blocking on. Not checked in a retrofit
+     that prepares nothing - there the CA is somebody else's and the grant is theirs. */
+  if (!scepStandalone() || scepPreparesCa()) {
+    if (!adcs.roleGroups.createGroups) {
+      error("Certificate Services", "<strong>" + esc(PKCS_CONNECTOR_GROUP) + "</strong> is what the connector enrolls through, and role " +
+        "group creation is switched off - so the group is never made, the ACEs name a principal that does not exist and nothing is ever " +
+        "issued.", "adcs.roleGroups.createGroups");
+    }
+    if (!adcs.roleGroups.applyCaSecurity) {
+      error("Certificate Services", "The connector needs <em>Request Certificates</em> on the CA and this design grants no permissions " +
+        "there. On a default CA the right rides on Authenticated Users and it happens to work; on a CA this design has tightened it does " +
+        "not, and the failure is an access denied that names nothing.", "adcs.roleGroups.applyCaSecurity");
+    }
+  }
+
+  if (!scep.grantRevocation) {
+    warn("Certificate Services", "Revocation is off, so the connector group is granted <em>Request Certificates</em> and nothing else. " +
+      "Intune will be able to issue certificates through this connector and never revoke one.");
+  }
+
+  /* Off is a legitimate choice on a forest that is not enforcing strong mapping yet,
+     and it is a choice somebody should make on purpose rather than discover. */
+  if (!scep.pkcs.sidExtension) {
+    warn("Certificate Services", "The SID security extension is off, so certificates from this connector carry no SID and fall back to " +
+      "the weak mapping KB5014754 exists to retire. Domain controllers have been in full enforcement since February 2025 - " +
+      "authentication with one of these certificates is denied, and nothing on this side reports it.", "adcs.scep.pkcs.sidExtension");
+  }
+}
+
 function validateScepSection(error, warn) {
   if (!scepEnabled()) { return; }
 
   /* Two letters or the installer refuses, and it refuses at the far end of a twenty
-     minute feature install. The rest of the subject is free text. */
-  const ra = state.adcs.scep.registrationAuthority || {};
-  const raCountry = String(ra.country || "").trim();
-  if (raCountry && !/^[A-Za-z]{2}$/.test(raCountry)) {
-    error("Certificate Services", "The registration authority country has to be the two-letter code - '" + raCountry +
-      "' is not one, and the NDES configuration refuses it at the end of the feature install rather than at the start.",
-      "adcs.scep.registrationAuthority.country");
-  }
-  if (!String(ra.name || "").trim()) {
-    warn("Certificate Services", "No registration authority name, so both certificates NDES enrols for itself are called " +
-      "<code>&lt;hostname&gt;-MSCEP-RA</code>. It is written once, when NDES is configured - changing it later means uninstalling " +
-      "the role service and configuring again.");
+     minute feature install. The rest of the subject is free text. PKCS mode enrols no
+     registration authority certificates at all, so none of this is its business. */
+  if (!scepPkcsMode()) {
+    const ra = state.adcs.scep.registrationAuthority || {};
+    const raCountry = String(ra.country || "").trim();
+    if (raCountry && !/^[A-Za-z]{2}$/.test(raCountry)) {
+      error("Certificate Services", "The registration authority country has to be the two-letter code - '" + raCountry +
+        "' is not one, and the NDES configuration refuses it at the end of the feature install rather than at the start.",
+        "adcs.scep.registrationAuthority.country");
+    }
+    if (!String(ra.name || "").trim()) {
+      warn("Certificate Services", "No registration authority name, so both certificates NDES enrols for itself are called " +
+        "<code>&lt;hostname&gt;-MSCEP-RA</code>. It is written once, when NDES is configured - changing it later means uninstalling " +
+        "the role service and configuring again.");
+    }
   }
 
   const adcs = state.adcs;
@@ -7383,11 +7766,24 @@ function validateScepSection(error, warn) {
       error("Certificate Services", "The retrofit needs the forest domain name. It is what the NDES server's internal FQDN is built " +
         "from, and that name is what its HTTPS certificate has to carry.", "adcs.shared.forestDomainName");
     }
-    const scepTemplate = scepTemplateItem();
-    if (!String((scepTemplate || {}).templateName || "").trim()) {
-      error("Certificate Services", "Name the certificate template the CA already publishes for SCEP. It goes into the MSCEP registry " +
-        "slots exactly as typed, and nothing in this design writes it.",
-        "adcs.issuing.templates.items." + adcs.issuing.templates.items.indexOf(scepTemplate) + ".templateName");
+    if (scepPkcsMode()) {
+      /* The same check, one level along: a PKCS profile names its template, so an
+         unnamed one is a profile field nobody can fill in. */
+      pkcsSelectedTemplateIds().forEach(function (id) {
+        const item = adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
+        if (item && String(item.templateName || "").trim()) { return; }
+        error("Certificate Services", "Name the certificate template the CA already publishes for PKCS. It is typed into the Intune " +
+          "profile's <em>Certificate template name</em> field exactly as it appears in the directory, and nothing in this design writes it.",
+          item ? ("adcs.issuing.templates.items." + adcs.issuing.templates.items.indexOf(item) + ".templateName") : "");
+      });
+    }
+    else {
+      const scepTemplate = scepTemplateItem();
+      if (!String((scepTemplate || {}).templateName || "").trim()) {
+        error("Certificate Services", "Name the certificate template the CA already publishes for SCEP. It goes into the MSCEP registry " +
+          "slots exactly as typed, and nothing in this design writes it.",
+          "adcs.issuing.templates.items." + adcs.issuing.templates.items.indexOf(scepTemplate) + ".templateName");
+      }
     }
     if (scepPreparesCa()) {
       const retrofit = scep.retrofit;
@@ -7474,6 +7870,10 @@ function validateScepSection(error, warn) {
         "longer does - this is a fault in the studio, not in the design.");
     }
   }
+
+  /* Everything past this point is NDES: slots, a service account, an HTTPS
+     certificate and an external URL, none of which exists in PKCS mode. */
+  if (scepPkcsMode()) { validatePkcsSection(error, warn); return; }
 
   /* The slots. A design where no slot names anything configures an NDES that keeps
      pointing at IPSECIntermediateOffline - which is a working server that issues
@@ -7919,15 +8319,25 @@ function validateAdcsSection(issues, error, warn) {
          keeps its normal grading, and approval or autoenrollment on it are errors of
          their own: SCEP never completes a pending request, and nothing autoenrolls
          through NDES. */
-      if (catalog.scepTemplate) {
+      /* The PKCS templates carry the same exception and a DIFFERENT reason for it, so
+         it is stated rather than shared. There is no policy module and no signed
+         challenge behind a PKCS request: the connector asks the CA directly. What makes
+         the shape acceptable is that the enrollment ACL is the entire control - one
+         group, holding one computer account - which is exactly what the grading asks
+         for in the ordinary case. The key being exportable makes the grant narrower
+         still, not wider: whoever can enroll can walk away with the key. */
+      if (catalog.scepTemplate || catalog.pkcsTemplate) {
+        const viaScep = !!catalog.scepTemplate;
         if (item.requireManagerApproval) {
-          error("Certificate Services", "The '" + item.displayName + "' template is held for manager approval, and SCEP cannot complete " +
-            "a pending request - every certificate Intune asks for is simply never issued. Drop the approval; the policy module is the review.",
+          error("Certificate Services", "The '" + item.displayName + "' template is held for manager approval, and " + (viaScep
+            ? "SCEP cannot complete a pending request - every certificate Intune asks for is simply never issued. Drop the approval; the policy module is the review."
+            : "the certificate connector cannot complete a pending request - the profile waits for ever and the certificate is never issued. Drop the approval; the enrollment ACL is the review."),
             itemPath + ".requireManagerApproval");
         }
         if (templatePrincipals(item).autoenroll.length) {
-          error("Certificate Services", "The '" + item.displayName + "' template has autoenroll principals - nothing autoenrolls through " +
-            "NDES, and any principal beyond the NDES service account widens what the policy module was supposed to be the only door to.",
+          error("Certificate Services", "The '" + item.displayName + "' template has autoenroll principals - " + (viaScep
+            ? "nothing autoenrolls through NDES, and any principal beyond the NDES service account widens what the policy module was supposed to be the only door to."
+            : "nothing autoenrolls through the certificate connector, and any principal beyond the connector's own group widens the ACL that is the only control this template has."),
             itemPath + ".autoenrollPrincipals");
         }
       }
@@ -10972,6 +11382,16 @@ function buildAdcsTemplateSection(includeIds) {
       clientVersion: compatibility.clientVersion
     },
     items: templates.items.filter(function (item) {
+      /* A template the connector blade owns is decided THERE and only there. Its item
+         still exists in this list - that is where its name, validity and key size live
+         - but its tick is not a second opinion, it is invisible state: the AD CS
+         template card filters these items out, so nothing on that blade can turn one
+         off again. Reading the tick meant the same design could build a template with
+         the connector switched off, or refuse to build one with it switched on,
+         depending on which reconcile had last run. Now: selected on the connector
+         blade, or not built. */
+      const catalog = templateCatalogEntry(item.id) || {};
+      if (catalog.scepTemplate || catalog.pkcsTemplate) { return forced.indexOf(item.id) !== -1; }
       return item.enabled || forced.indexOf(item.id) !== -1;
     }).map(function (item) {
       const catalog = templateCatalogEntry(item.id) || {};
@@ -10984,6 +11404,7 @@ function buildAdcsTemplateSection(includeIds) {
       const ownCompatibility = catalog.compatibilityLevel ? templateCompatibility(catalog.compatibilityLevel) : null;
       const extras = {};
       if (catalog.scepTemplate) { extras.scepTemplate = true; }
+      if (catalog.pkcsTemplate) { extras.pkcsTemplate = true; }
       /* Only when it is not the default one, so every other template's contract is
          unchanged and an older reader sees exactly what it saw before. The item carries
          it now rather than the catalogue: one template pins a provider by construction
@@ -11300,7 +11721,7 @@ function applyAcmeRenewalDocument(fresh, document) {
   else if (target.id === "remoteDesktop") { certificate = (document.remoteDesktop || {}).certificate; }
   else if (target.id === "exchange") { certificate = (document.exchange || {}).certificate; }
   else if (target.id === "certificateConnector") {
-    certificate = ((document.certificateServices || {}).scep || {}).certificate;
+    certificate = (adcsConnectorSection(document.certificateServices) || {}).certificate;
   }
   if (!certificate) { return; }
 
@@ -11938,7 +12359,7 @@ function buildAdcsSection(includeSecrets) {
     rekeyKeyLength: Number(adcs.issuing.renewal.rekeyKeyLength) || 4096,
     forceNow: !!adcs.issuing.renewal.forceNow
   };
-  issuing.templates = buildAdcsTemplateSection();
+  issuing.templates = buildAdcsTemplateSection(connectorForcedTemplateIds());
 
   return {
     mode: (adcs.mode === "adopt") ? "adopt" : "build",
@@ -11974,10 +12395,13 @@ function buildAdcsSection(includeSecrets) {
       applyUserRights: !!adcs.roleGroups.applyUserRights,
       scope: adcs.roleGroups.scope,
       organizationalUnit: String(adcs.roleGroups.organizationalUnit || "").trim(),
+      /* The five role groups the design picked, plus the connector's own when this
+         is a PKCS design - it is a role group in every sense that matters here: it
+         holds rights on the CA and it is created by the same run. */
       groups: adcs.roleGroups.items.filter(function (item) { return item.enabled; }).map(function (item) {
         const catalog = roleGroupCatalogEntry(item.id) || {};
         return { id: item.id, name: roleGroupName(item.id), role: catalog.role, description: catalog.description };
-      })
+      }).concat(pkcsConnectorRoleGroups())
     },
     /* Only the name: this tier installs nothing, so there is no key, no lifetime and
        no CRL to describe. The script matches its own computer name against it the
@@ -11986,7 +12410,10 @@ function buildAdcsSection(includeSecrets) {
       computerName: String(adcs.directory.computerName || "").trim(),
       groupPolicy: buildAdcsGroupPolicySection()
     },
-    scep: buildAdcsScepSection(includeSecrets),
+    /* Named for what the tier is rather than for one of its two modes. The reader
+       still accepts `scep` from a document written before PKCS existed - see
+       adcsConnectorSection. */
+    intuneConnector: buildAdcsScepSection(includeSecrets),
     root: buildAdcsTier(adcs.root),
     issuing: issuing
   };
@@ -12005,10 +12432,21 @@ function buildAdcsSection(includeSecrets) {
    role on the next import. Where the two disagree this answers no, which is the safe
    direction: a retrofit misread as a design shows up as a blade full of validation
    errors, a design misread as a retrofit shows up as nothing at all. */
+/* The tier was called `scep` before it had a second mode and is called
+   `intuneConnector` now. Both spellings are read, the new one first, so a config.json
+   written by an earlier build still imports as the design it was - there is no
+   migration step and nothing rewrites the old file. Exports only ever carry the new
+   name. */
+function adcsConnectorSection(pki) {
+  const services = pki || {};
+  return services.intuneConnector || services.scep || null;
+}
+
 function isScepOnlyDocument(document) {
   const pki = (document || {}).certificateServices;
-  if (!pki || !pki.scep || pki.scep.enabled === false || pki.scep.standalone !== true) { return false; }
-  if (!String(pki.scep.computerName || "").trim()) { return false; }
+  const connector = adcsConnectorSection(pki);
+  if (!pki || !connector || connector.enabled === false || connector.standalone !== true) { return false; }
+  if (!String(connector.computerName || "").trim()) { return false; }
   /* The root tier stays unnamed in **both** shapes of retrofit, and that is the lock:
      a design that cannot name a root is a design that cannot build a PKI however it is
      run. Connector mode names a domain controller and an issuing CA on purpose, so the
@@ -12055,10 +12493,10 @@ function buildScepOnlySection(includeSecrets) {
   /* Forced in regardless of their ticks, because an unticked item would silently empty
      the MSCEP slot that names it. Every template a slot picked, not just the one there
      used to be. */
-  const templates = buildAdcsTemplateSection(scepSelectedTemplateIds());
+  const templates = buildAdcsTemplateSection(connectorForcedTemplateIds());
   templates.enabled = false;
   templates.unpublishOthers = false;
-  templates.items = (templates.items || []).filter(function (item) { return !!item.scepTemplate; });
+  templates.items = (templates.items || []).filter(function (item) { return !!item.scepTemplate || !!item.pkcsTemplate; });
 
   /* Two shapes of retrofit, and the difference is how much of the CA side this design
      is allowed to touch.
@@ -12121,7 +12559,7 @@ function buildScepOnlySection(includeSecrets) {
     /* standalone is for the studio reading its own export back - see
        isScepOnlyDocument. The run never looks at it: what stops it building a CA is
        that no CA tier is named, not a field it could be asked to trust. */
-    scep: Object.assign(buildAdcsScepSection(includeSecrets), { standalone: true }),
+    intuneConnector: Object.assign(buildAdcsScepSection(includeSecrets), { standalone: true }),
     root: { computerName: "" },
     issuing: {
       computerName: prepare ? String(state.adcs.scep.retrofit.issuingComputerName || "").trim() : "",
@@ -12134,6 +12572,7 @@ function buildScepOnlySection(includeSecrets) {
 function buildAdcsScepSection(includeSecrets) {
   const scep = state.adcs.scep;
   if (!scep.enabled) { return { enabled: false }; }
+  if (scepPkcsMode()) { return buildAdcsPkcsSection(); }
 
   const source = scep.certificate.source;
   /* Both the internal and the external name, always - see scepCertificateNames. */
@@ -12166,6 +12605,7 @@ function buildAdcsScepSection(includeSecrets) {
 
   return {
     enabled: true,
+    connectorMode: "scep",
     computerName: String(scep.computerName || "").trim(),
     externalUrl: String(scep.externalUrl || "").trim(),
     registrationAuthority: scepRegistrationAuthority(),
@@ -12203,6 +12643,32 @@ function buildAdcsScepSection(includeSecrets) {
     },
     grantRevocation: !!scep.grantRevocation,
     certificate: certificate
+  };
+}
+
+/* The PKCS contract, and most of it is what is NOT here. No external URL, because
+   nothing answers a request from outside; no registration authority, because there
+   is none; no IIS site, no service account, no feature source, no DNS record and no
+   certificate of its own, because this machine runs no web server. What is left is
+   the machine, the templates it enrolls, the group it enrolls through, and one
+   registry value. */
+function buildAdcsPkcsSection() {
+  const scep = state.adcs.scep;
+  return {
+    enabled: true,
+    connectorMode: "pkcs",
+    computerName: String(scep.computerName || "").trim(),
+    /* Names, not catalogue ids, and a LIST rather than the slot map the other mode
+       carries - the shape says which mode wrote it. A name here is the same string
+       the Intune profile's "Certificate template name" field takes. */
+    templateNames: pkcsSelectedTemplateIds().map(pkcsTemplateName).filter(function (name) { return !!name; }),
+    /* One group for both templates and for the CA. The directory run creates it and
+       puts this machine's computer account in it; the issuing run grants it Read and
+       Enroll on each template and writes its ACE on the CA. */
+    enrollmentGroup: PKCS_CONNECTOR_GROUP,
+    /* KB5014754 strong mapping. Written on the connector host, never here. */
+    sidExtension: !!scep.pkcs.sidExtension,
+    grantRevocation: !!scep.grantRevocation
   };
 }
 
@@ -13343,9 +13809,13 @@ function applyConfigDocument(document) {
         fresh.adcs.issuing.renewal.rekeyKeyLength = Number(pki.issuing.renewal.rekeyKeyLength) || 4096;
       }
     }
-    if (pki.scep && pki.scep.enabled) {
-      const scep = pki.scep;
+    const connectorDoc = adcsConnectorSection(pki);
+    if (connectorDoc && connectorDoc.enabled) {
+      const scep = connectorDoc;
       fresh.adcs.scep.enabled = true;
+      /* Absent means a document written before the mode existed, and every one of
+         those is a SCEP design - the default already says so. */
+      fresh.adcs.scep.connectorMode = (String(scep.connectorMode || "scep") === "pkcs") ? "pkcs" : "scep";
       fresh.adcs.scep.computerName = String(scep.computerName || "");
       fresh.adcs.scep.externalUrl = String(scep.externalUrl || "");
       if (scep.registrationAuthority) {
@@ -13394,6 +13864,34 @@ function applyConfigDocument(document) {
              inventing a certificate nobody asked for. */
           fresh.adcs.scep.templates[slot.key] = wanted ? (byName[wanted] || "") : "";
         });
+      }
+      /* The PKCS half. Templates come back as NAMES, the same as the slots, and are
+         matched to catalogue ids against the templates this document builds - a name
+         the document does not build resolves to nothing rather than to a guess. */
+      if (scep.connectorMode === "pkcs") {
+        const pkcsByName = {};
+        (((pki.issuing || {}).templates || {}).items || []).forEach(function (item) {
+          if (item && item.templateName) { pkcsByName[String(item.templateName).toLowerCase()] = String(item.id || ""); }
+        });
+        if (Array.isArray(scep.templateNames)) {
+          /* Two ways to resolve a name, and the second one is what makes a bad
+             document recoverable. The document's own items come first - a template
+             renamed in the design must still map back to its catalogue entry. Failing
+             that, the catalogue's OWN default name is tried, because a contract whose
+             connector names a template the issuing tier never built would otherwise
+             import as an empty selection, re-export as a connector with no templates
+             at all, and quietly stay broken. That is exactly how one bench build
+             published four templates and none of the two it needed. */
+          const pkcsByDefaultName = {};
+          pkcsTemplateChoices().forEach(function (entry) {
+            pkcsByDefaultName[entry.displayName.replace(/[^A-Za-z0-9]/g, "").toLowerCase()] = entry.id;
+          });
+          fresh.adcs.scep.pkcs.templates = scep.templateNames.map(function (name) {
+            const key = String(name || "").trim().toLowerCase();
+            return pkcsByName[key] || pkcsByDefaultName[key] || "";
+          }).filter(function (id) { return !!id; });
+        }
+        if (scep.sidExtension != null) { fresh.adcs.scep.pkcs.sidExtension = scep.sidExtension !== false; }
       }
       if (scep.serviceAccount) {
         fresh.adcs.scep.serviceAccount.enabled = scep.serviceAccount.enabled !== false;
@@ -13574,6 +14072,15 @@ function applyConfigDocument(document) {
     }
   }
   state = fresh;
+
+  /* After the commit, never before: this reconciles `state`, and until the line above
+     `state` is still the document being replaced. The connector's selection decides
+     which template ITEMS are built and nothing else does, so a document that named a
+     template the issuing tier never wrote imports, is corrected here, and exports
+     whole. Without it the studio could read a broken config and only write it back
+     the same way - which is how one bench build published four templates and neither
+     of the two its connector needed. */
+  syncScepTemplateSelection();
 }
 
 /* config.json splits the shared subnet list across two sections - fold it back into
@@ -14203,6 +14710,20 @@ function decodeState(text) {
     return { _id: uid("acct"), account: (typeof a === "string") ? a : (a.account || "") };
   });
   state = fresh;
+
+  /* The SECOND place a whole state is committed, and it needs the same reconcile as
+     applyConfigDocument for the same reason. A saved state or a resume link carries
+     the connector's template SELECTION and the issuing tier's template ITEMS as two
+     separate facts; nothing between them is recomputed on the way in. Restore a state
+     saved before the items were ticked and the studio comes up with both templates
+     selected on the connector blade, both items unticked underneath, and the validation
+     correctly reporting that the connector asks for templates the design does not
+     build - about a design whose switches are visibly on. Field-hit 2026-09-19.
+
+     Only one of these two commits had the reconcile, which is the whole lesson: a state
+     invariant has to be restored everywhere a state is restored, not everywhere it was
+     convenient to remember. */
+  syncScepTemplateSelection();
 }
 function resumeLink() {
   return location.origin + location.pathname + "#" + encodeState();
@@ -18691,7 +19212,7 @@ function renderAdcsAccessCard() {
 function adcsCardTemplateItems() {
   return state.adcs.issuing.templates.items.filter(function (item) {
     const catalog = templateCatalogEntry(item.id) || {};
-    return !catalog.scepTemplate;
+    return !catalog.scepTemplate && !catalog.pkcsTemplate;
   });
 }
 
@@ -26065,6 +26586,31 @@ function scepUnroutableNames() {
    it is this role's - so the card lives here and the AD CS blade only mentions it. */
 /* The retrofit's CA-side half. Its own card because it is its own decision and its own
    contract mode - "connector" - not a variation on the switch above. */
+/* The two strings a PKCS profile takes that this studio already knows, and that are
+   otherwise transcribed off a screen: the issuing CA's internal FQDN and its common
+   name. Which tier holds them depends on the shape - a full design names the issuing
+   CA on its own blade, a retrofit names it on this one. */
+function pkcsCertificationAuthority() {
+  const adcs = state.adcs;
+  const retrofit = adcs.scep.retrofit || {};
+  const host = String((scepStandalone() ? retrofit.issuingComputerName : adcs.issuing.computerName) || "").trim().toLowerCase();
+  const domain = String(adcs.shared.forestDomainName || "").trim().toLowerCase();
+  const name = String((scepStandalone() ? retrofit.caCommonName : adcs.issuing.caCommonName) || "").trim();
+  return { fqdn: (host && domain) ? (host + "." + domain) : "", name: name };
+}
+
+/* Which connector feature this machine is built for. Exclusive, and the tabs say so:
+   the two modes share a machine name and nothing else. */
+function renderConnectorTabs() {
+  const mode = scepPkcsMode() ? "pkcs" : "scep";
+  return '<div class="blade-tabs">' +
+    '<button class="blade-tab' + (mode === "pkcs" ? " active" : "") + '" type="button" data-connector-mode="pkcs">' +
+      icon("certificate.svg", 16) + 'PKCS</button>' +
+    '<button class="blade-tab' + (mode === "scep" ? " active" : "") + '" type="button" data-connector-mode="scep">' +
+      icon("cert-connector.svg", 16) + 'SCEP (NDES)</button>' +
+  '</div>';
+}
+
 function renderScepRetrofitCard() {
   const retrofit = state.adcs.scep.retrofit;
   const prepare = scepPreparesCa();
@@ -26078,7 +26624,9 @@ function renderScepRetrofitCard() {
 
     toggleField({ label: "Prepare the directory and the CA for the connector", path: "adcs.scep.retrofit.prepareCa", rerender: true,
       sub: hintPair("On, this design does the groundwork a retrofit otherwise leaves as homework.",
-        "That is the service account and its groups on the domain controller, and the SCEP templates plus one CA permission on the " +
+        (scepPkcsMode()
+          ? "That is one group on the domain controller with this machine's computer account in it, and the PKCS templates plus the connector's permissions on the "
+          : "That is the service account and its groups on the domain controller, and the SCEP templates plus one CA permission on the ") +
         "issuing CA. It is <strong>not</strong> an adoption - nothing about how that CA runs is touched. Off, everything on the CA " +
         "side is a fact that has to be true already, which is the right answer when somebody else owns the directory and the CA and " +
         "you are only allowed near the connector.") }) +
@@ -26090,7 +26638,9 @@ function renderScepRetrofitCard() {
             invalid: !!String(retrofit.directoryComputerName || "").trim() &&
               (!isNetbios(String(retrofit.directoryComputerName || "").trim()) ||
                String(retrofit.directoryComputerName || "").trim().length > NETBIOS_MAX),
-            hint: "Where the service account and the groups are created. Run the config here first." }) +
+            hint: scepPkcsMode()
+              ? "Where the connector's group is created and its computer account put in it. Run the config here first."
+              : "Where the service account and the groups are created. Run the config here first." }) +
           fieldText({ label: "Issuing CA computer", path: "adcs.scep.retrofit.issuingComputerName", rerender: true, spellcheck: false,
             required: true, placeholder: "ca-sub-01",
             invalid: !!String(retrofit.issuingComputerName || "").trim() &&
@@ -26352,7 +26902,14 @@ function renderScepTemplateCard(template) {
   /* Read from the item, not from a fixed id: this card renders once per template a
      slot has picked, and there is more than one of them now. */
   const catalog = templateCatalogEntry(template.id) || {};
-  const slots = SCEP_SLOTS.filter(function (slot) { return scepSlotSelection(slot.key) === template.id; });
+  /* There are no slots in PKCS mode - a profile names its template outright - so every
+     slot-shaped question below has to stop being asked rather than be answered "no".
+     "IN NO SLOT" on a template that is working perfectly is the studio reporting a
+     failure that cannot happen in the mode it is rendering. */
+  const viaPkcs = !!catalog.pkcsTemplate;
+  const slots = viaPkcs
+    ? []
+    : SCEP_SLOTS.filter(function (slot) { return scepSlotSelection(slot.key) === template.id; });
   const slotLabel = slots.map(function (slot) { return slot.label; }).join(" + ");
   /* In the ORIGINAL retrofit nothing here is written: no issuing tier is in the design,
      so this card describes the template the CA already publishes and the only field that
@@ -26371,14 +26928,19 @@ function renderScepTemplateCard(template) {
   /* Named by a slot is what puts a template in the contract; the item's tick only
      matters in a full design, where nothing forces it in. `namesOnly` is published by
      definition - the CA already has it, which is the whole premise of that mode. */
+  const selectedForPkcs = viaPkcs && pkcsSelectedTemplateIds().indexOf(template.id) !== -1;
   const published = namesOnly
     ? true
-    : (slots.length > 0 && templatesOn && (scepPreparesCa() || template.enabled));
+    : (viaPkcs
+        ? (selectedForPkcs && templatesOn && (scepPreparesCa() || template.enabled))
+        : (slots.length > 0 && templatesOn && (scepPreparesCa() || template.enabled)));
 
   return cardOpen("certificate.svg", String(catalog.displayName || "SCEP template"),
       namesOnly
         ? "The template this CA already publishes"
-        : (slotLabel ? ("Served in the " + slotLabel + " slot") : "Not in any slot"),
+        : (viaPkcs
+            ? "Named by the Intune profile"
+            : (slotLabel ? ("Served in the " + slotLabel + " slot") : "Not in any slot")),
       /* `template.enabled` is the ITEM'S OWN TICK, and in a retrofit the tick is not what
          decides: `buildScepOnlySection` forces every template a slot names into the
          contract regardless of it, because an unticked item would silently empty that
@@ -26388,7 +26950,9 @@ function renderScepTemplateCard(template) {
       '<span class="pill status ' + (published ? "on" : "warn") + '">' +
         (published
           ? esc(template.templateName || "Published")
-          : (slots.length ? (templatesOn ? "Not published" : "Templates off") : "In no slot")) + '</span>',
+          : (viaPkcs
+              ? (selectedForPkcs ? (templatesOn ? "Not published" : "Templates off") : "Not issued")
+              : (slots.length ? (templatesOn ? "Not published" : "Templates off") : "In no slot"))) + '</span>',
       { key: "scep-template-" + template.id, defaultOpen: true }) +
 
     (namesOnly
@@ -26407,7 +26971,9 @@ function renderScepTemplateCard(template) {
       fieldText({ label: "Template display name", path: path + ".displayName", rerender: true, spellcheck: false,
         hint: "What the certificate templates console shows." }) +
       fieldText({ label: "Template name", path: path + ".templateName", rerender: true, spellcheck: false,
-        hint: "The object name, and <strong>exactly what goes into the MSCEP registry slots</strong> - never the display name." }) +
+        hint: viaPkcs
+          ? "The object name, and <strong>exactly what is typed into the Intune profile's <em>Certificate template name</em></strong> - never the display name."
+          : "The object name, and <strong>exactly what goes into the MSCEP registry slots</strong> - never the display name." }) +
     '</div>' +
     templatePeriodRow({
       label: "Validity",
@@ -26462,8 +27028,12 @@ function renderScepTemplateCard(template) {
         : ""),
       factRow({ name: "Enrolled by", value: derivedGroupNameFor(template),
         why: standalone
-          ? "The NDES service account, and nothing else. Whatever the CA's own enrollment group is called, that account has to be in it already."
-          : "The NDES service account, and nothing else. The directory run puts it in." })
+          ? (catalog.pkcsTemplate
+              ? "The connector's computer account, and nothing else. Whatever the CA's own enrollment group is called, that machine has to be in it already."
+              : "The NDES service account, and nothing else. Whatever the CA's own enrollment group is called, that account has to be in it already.")
+          : (catalog.pkcsTemplate
+              ? "The connector's computer account, and nothing else. The directory run puts it in."
+              : "The NDES service account, and nothing else. The directory run puts it in.") })
     ]) +
 
     /* The other half of the template, and the half that breaks silently. A SCEP profile
@@ -26472,7 +27042,46 @@ function renderScepTemplateCard(template) {
        the certificate actually contains. Pick the wrong key usage and nothing errors -
        a certificate is issued from whichever template that slot happens to name. So the
        settings that reach *this* template are written down beside it. */
-    (catalog.intuneProfile
+    (catalog.intuneProfile && catalog.pkcsTemplate
+      ? disclosure("pkcs-profile-" + template.id, "The Intune PKCS profile that reaches this template",
+          dataTable([
+            { label: "Setting", width: "minmax(170px, 230px)" },
+            { label: "Value", width: "minmax(240px, 1fr)" }
+          ], [
+            [ '<div class="dt-stack"><span class="dt-value">Certification authority</span>' +
+                '<span class="dt-sub">the internal FQDN, not a URL</span></div>',
+              '<span class="dt-value"><code>' + esc(pkcsCertificationAuthority().fqdn || "&lt;issuing CA&gt;.&lt;domain&gt;") + '</code></span>' ],
+            [ '<div class="dt-stack"><span class="dt-value">Certification authority name</span>' +
+                '<span class="dt-sub">as the Certification Authority console shows it</span></div>',
+              '<span class="dt-value"><code>' + esc(pkcsCertificationAuthority().name || "&lt;CA common name&gt;") + '</code></span>' ],
+            [ '<div class="dt-stack"><span class="dt-value">Certificate template name</span>' +
+                '<span class="dt-sub">the name, not the display name - spaces removed</span></div>',
+              '<span class="dt-value"><code>' + esc(String(template.templateName || "").trim() || "&lt;not named yet&gt;") + '</code></span>' ],
+            [ '<span class="dt-value">Certificate type</span>',
+              '<span class="dt-value">' + esc(catalog.intuneProfile.certificateType) + '</span>' ],
+            [ '<span class="dt-value">Key storage provider</span>',
+              '<span class="dt-value">' + esc(catalog.intuneProfile.keyStorageProvider) + '</span>' ],
+            [ '<span class="dt-value">Subject name format</span>',
+              '<span class="dt-value"><code>' + esc(catalog.intuneProfile.subjectName) + '</code></span>' ],
+            [ '<div class="dt-stack"><span class="dt-value">Subject alternative name</span>' +
+                '<span class="dt-sub">' + esc(catalog.intuneProfile.sanWhy || "") + '</span></div>',
+              '<span class="dt-value"><code>' + esc(catalog.intuneProfile.subjectAltName) + '</code></span>' ],
+            [ '<span class="dt-value">Extended key usage</span>',
+              '<span class="dt-value">' + esc(catalog.intuneProfile.extendedKeyUsage ||
+                (catalog.extendedKeyUsage || []).map(ekuLabel).join(", ")) + '</span>' ],
+            [ '<span class="dt-value">Certificate validity period</span>',
+              '<span class="dt-value">' + esc(periodLabel(templateValidity(template))) +
+                ' at most - the template caps it</span>' ],
+            [ '<span class="dt-value">Renewal threshold</span>',
+              '<span class="dt-value">20% is Microsoft\'s recommendation</span>' ]
+          ]) +
+          '<p class="hint">The three rows at the top are typed by hand into the profile and are the most common reason a PKCS ' +
+            'deployment fails - Microsoft\'s own troubleshooting article opens by telling you to check them for typos. Note there ' +
+            'is <strong>no key usage field</strong> in a PKCS profile: unlike SCEP, nothing in the profile routes or describes the ' +
+            'certificate, so the template alone decides what is issued.</p>', "cert-connector.svg")
+      : "") +
+
+    (catalog.intuneProfile && !catalog.pkcsTemplate
       ? disclosure("scep-profile-" + template.id, "The Intune SCEP profile that reaches this template",
           dataTable([
             { label: "Setting", width: "minmax(170px, 230px)" },
@@ -26505,13 +27114,261 @@ function renderScepTemplateCard(template) {
             'one and a certificate arrives from the wrong template with nothing reported anywhere.</p>', "cert-connector.svg")
       : "") +
 
-    warnBox("This template is only safe <strong>guarded</strong>. The requester names the subject and the enrollment ACL cannot check " +
-      "it, so the Intune policy module on the NDES server is the actual control - it validates every request against a signed " +
-      "challenge from Intune. Keep the enrollment group at exactly the service account, never put manager approval on it (SCEP " +
-      "cannot complete a pending request, so the certificate is simply never issued), and do not re-enable " +
-      "<code>EDITF_ATTRIBUTESUBJECTALTNAME2</code> to \"make SANs work\" - the SAN comes from the request, which the module checks, " +
-      "and that flag would reopen ESC6 for the whole CA.") +
+    /* Two modes, two different reasons the same template shape is acceptable, and they
+       must not be swapped: SCEP is guarded by the policy module's signed challenge,
+       PKCS has no policy module and no challenge at all and is guarded by the ACL
+       alone. Printing the SCEP sentence on a PKCS card tells the reader a control is
+       protecting them that is not there. */
+    (viaPkcs
+      ? warnBox("This template is only safe <strong>narrow</strong>. The requester names the subject, the EKU authenticates, and the " +
+          "private key is exportable - and unlike SCEP there is <strong>no policy module and no signed challenge</strong> behind it, " +
+          "because the connector asks the CA directly. The <strong>enrollment ACL is the entire control</strong>: exactly one group, " +
+          "holding exactly the connector's computer account, with Domain Users removed. Never put manager approval on it - the " +
+          "connector cannot complete a pending request, so the profile waits for ever and the certificate is never issued.")
+      : warnBox("This template is only safe <strong>guarded</strong>. The requester names the subject and the enrollment ACL cannot check " +
+          "it, so the Intune policy module on the NDES server is the actual control - it validates every request against a signed " +
+          "challenge from Intune. Keep the enrollment group at exactly the service account, never put manager approval on it (SCEP " +
+          "cannot complete a pending request, so the certificate is simply never issued), and do not re-enable " +
+          "<code>EDITF_ATTRIBUTESUBJECTALTNAME2</code> to \"make SANs work\" - the SAN comes from the request, which the module checks, " +
+          "and that flag would reopen ESC6 for the whole CA.")) +
   cardClose();
+}
+
+/* ---------------------------[ The connector: PKCS mode ]--------------------------- */
+
+/* The picker, and it is only a picker: there is no slot table under it, because a
+   PKCS profile carries the template's name. Nothing routes, so nothing can route
+   wrongly - the failure this card exists to prevent in SCEP mode cannot happen here. */
+function renderPkcsTemplatePickerCard() {
+  const choices = pkcsTemplateChoices();
+  const on = pkcsSelectedTemplateIds();
+
+  const rows = choices.map(function (catalog) {
+    const selected = on.indexOf(catalog.id) !== -1;
+    const item = state.adcs.issuing.templates.items.filter(function (entry) { return entry.id === catalog.id; })[0];
+    return {
+      className: selected ? "" : "is-off",
+      cells: [
+        '<label class="toggle mini" title="' + esc("Issue " + catalog.displayName) + '">' +
+          '<input type="checkbox" data-pkcs-template="' + esc(catalog.id) + '"' + (selected ? " checked" : "") + '>' +
+          '<span class="toggle-track"><span class="toggle-thumb"></span></span>' +
+        '</label>',
+        '<div class="dt-stack">' +
+          '<span class="dt-value">' + esc(catalog.displayName) + '</span>' +
+          '<span class="dt-sub">' + esc(String(catalog.purpose || "")) + '</span>' +
+        '</div>',
+        (selected && item
+          ? '<span class="dt-value"><code>' + esc(item.templateName || "") + '</code></span>'
+          : '<span class="dt-value is-none">Not issued</span>')
+      ]
+    };
+  });
+
+  return cardOpen("cert-template.svg", "Templates this connector issues", "One switch each - the profile names it",
+      '<span class="pill status ' + (on.length ? "on" : "off") + '">' + on.length + " of " + choices.length + '</span>',
+      { key: "pkcs-templates", defaultOpen: true }) +
+
+    dataTable([
+      { label: "Issue", width: "72px", center: true },
+      { label: "Template", width: "minmax(280px, 1fr)" },
+      { label: "Name a profile asks for", width: "minmax(200px, 280px)" }
+    ], rows) +
+
+    '<p class="hint"><strong>There is no ceiling here.</strong> A SCEP profile has no template field - it states a key usage, which ' +
+      'routes the request to one of three registry slots, so one NDES server serves three templates and a fourth needs a second ' +
+      'server. A PKCS profile names its template outright, so this list can grow as far as the design needs.</p>' +
+
+    (on.length === 0
+      ? warnBox("No template is selected, so this connector has nothing to enroll. A profile naming a template the CA does not " +
+          "publish fails with <em>The requested certificate template is not supported by this CA</em>.")
+      : "") +
+    cardClose();
+}
+
+/* The three strings somebody types into the profile by hand. They are here because
+   Microsoft's own PKCS troubleshooting article opens with them: "the most common
+   source of problems has been with the configuration of the PKCS certificate
+   profile - look for typos in server names or fully qualified domain names". The
+   studio knows all three; printing them costs nothing and removes the transcription. */
+/* Says WHICH field is missing and WHERE it lives, because the two shapes keep it in
+   different places - and a row that says "name the CA first" without saying where is a
+   dead end on a blade that does not hold the field. */
+function pkcsMissingCaHint(what) {
+  if (scepStandalone()) {
+    return "Fill in " + what + " in <strong>What this design does on the CA side</strong> above.";
+  }
+  return "Fill in " + what + " on the <a href=\"#\" data-goto=\"adcs\">Certificate Services</a> blade.";
+}
+
+function renderPkcsProfileCard() {
+  const ca = pkcsCertificationAuthority();
+  const names = pkcsSelectedTemplateIds().map(function (id) {
+    const item = state.adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
+    return { id: id, name: String((item || {}).templateName || "").trim(), display: (templateCatalogEntry(id) || {}).displayName };
+  });
+  const complete = !!ca.fqdn && !!ca.name && names.every(function (entry) { return !!entry.name; });
+
+  return cardOpen("certificate.svg", "What to type into the Intune profile", "The three fields that are transcribed by hand",
+      '<span class="pill status ' + (complete ? "on" : "warn") + '">' + (complete ? "Ready" : "Incomplete") + '</span>',
+      { key: "pkcs-profile-values", defaultOpen: true }) +
+
+    dataTable([
+      { label: "Profile field", width: "minmax(200px, 260px)" },
+      { label: "Value", width: "minmax(240px, 1fr)" }
+    ], [
+      { cells: [
+          '<div class="dt-stack"><span class="dt-value">Certification authority</span>' +
+            '<span class="dt-sub">the internal FQDN of the issuing CA</span></div>',
+          ca.fqdn
+            ? '<span class="dt-value"><code>' + esc(ca.fqdn) + '</code></span>'
+            : '<span class="dt-value is-none">' + pkcsMissingCaHint("the issuing CA's computer name and the forest domain") + '</span>' ] },
+      { cells: [
+          '<div class="dt-stack"><span class="dt-value">Certification authority name</span>' +
+            '<span class="dt-sub">as the Certification Authority console shows it</span></div>',
+          ca.name
+            ? '<span class="dt-value"><code>' + esc(ca.name) + '</code></span>'
+            : '<span class="dt-value is-none">' + pkcsMissingCaHint("the CA's common name") + '</span>' ] }
+    ].concat(names.map(function (entry) {
+      return { cells: [
+        '<div class="dt-stack"><span class="dt-value">Certificate template name</span>' +
+          '<span class="dt-sub">for ' + esc(entry.display || entry.id) + '</span></div>',
+        entry.name
+          ? '<span class="dt-value"><code>' + esc(entry.name) + '</code></span>'
+          : '<span class="dt-value is-none">Not named yet</span>' ] };
+    }))) +
+
+    '<p class="hint">The template row is the <strong>name</strong>, not the display name - AD CS strips the spaces when the object ' +
+      'is created, and the profile wants the object. A profile carrying the display name fails every request.</p>' +
+    cardClose();
+}
+
+/* PKCS mode's whole blade. It is short because the mode is: no NDES, no IIS, no
+   registry slots, no service account, no HTTPS certificate and no external URL. What
+   is left is a machine, the templates it enrolls, and one registry value on it. */
+function renderConnectorPkcs() {
+  const scep = state.adcs.scep;
+  const internalFqdn = derivedScepInternalFqdn();
+  const selected = pkcsSelectedTemplateIds();
+
+  return '<div class="page-title">' + icon("cert-connector.svg", 22) + 'Intune Certificate Connector</div>' +
+    '<div class="page-sub">' + hintPair(
+      'Certificates for devices that never touch the domain, issued by the connector and handed to Intune as a PKCS#12.',
+      'The connector asks the CA directly over RPC - there is no web endpoint, no registration authority and nothing published to ' +
+      'the internet. Microsoft\'s placement rule still makes it its own box: the connector is not supported on the issuing CA.') + '</div>' +
+
+    renderConnectorTabs() +
+
+    (scepStandalone()
+      ? infoBox("<strong>No Certificate Services role in this design, so this is the retrofit.</strong> The CA already exists and this " +
+          "design does not describe it - <strong>no CA is ever built</strong>, however or wherever this config is run, because no root " +
+          "is named. What the retrofit does on the CA side is the card below.")
+      : "") +
+
+    renderPkcsRunbook() +
+
+    (scepStandalone() ? renderScepRetrofitCard() : "") +
+
+    cardOpen("cert-connector.svg", "PKCS for Intune", "The connector asks the CA directly - no NDES, no IIS",
+        '<span class="pill status on">Configured</span>',
+        { key: "pkcs-enable", defaultOpen: true }) +
+      toggleField({ label: "Configure this server for the Intune PKCS connector", path: "adcs.scep.enabled", rerender: true,
+        sub: hintPair("Prepares the CA side and the connector host - the connector install itself stays manual.",
+          "The directory run creates one group and puts this machine's computer account in it, the issuing CA run publishes the " +
+          "templates and writes the group's permissions on the CA, and the run on this server checks its prerequisites and sets the " +
+          "SID extension. The connector download is an interactive Entra sign-in and there is no unattended path.") }) +
+
+      infoBox("<strong>This mode installs no Windows feature.</strong> That is worth saying because the SCEP mode is one of the three " +
+        "exceptions in this project allowed to install its own roles - NDES is a dozen features in an order. PKCS is none of them: no " +
+        "IIS, no AD CS role service, no .NET 3.5. The exception does not travel with the tier, it belongs to NDES.") +
+
+      factSection("pkcs-install-facts", [
+        factRow({ name: "Installs", value: "Nothing",
+          why: "The connector reaches the CA over RPC as a client. There is no role service to add and no reboot to take - which is also why this mode has no reboot boundary at all." }),
+        factRow({ name: "Checks", value: "Desktop Experience, .NET 4.7.2, TLS 1.2",
+          why: "All three are connector prerequisites. Server Core is refused rather than fixed: the connector needs Desktop Experience and a Core installation cannot be converted after setup." }),
+        factRow({ name: "Also sets", value: "Enhanced Security Configuration off",
+          why: "The connector configuration wizard signs in to Entra in a browser, and Enhanced Security Configuration is what stops that working. It is a stated connector prerequisite." }),
+        factRow({ name: "The connector's own account", value: "SYSTEM",
+          why: "The installer's default, and this design's choice. It reaches the CA as this machine's <strong>computer account</strong>, which is the identity Microsoft's own <em>Denied by Policy Module</em> fix grants Read and Enroll to. A domain account is supported too - it has to be a local administrator here - and if you use one, put it in the same group and nothing else changes." }),
+        factRow({ name: "Wants Windows Server 2019 or later", value: "for strong mapping, not for the install",
+          why: "The connector installs on 2012 R2 and later. <strong>Strong mapping is supported only on 2019 or later</strong>, so on an older server the SID extension below does nothing and the certificates it issues are refused at authentication rather than at enrolment. The run reports the build rather than blocking on it." }),
+        factRow({ name: "Stays manual", value: "The connector itself",
+          why: "The download lives behind your tenant and the configuration is an interactive Entra sign-in as an Intune Administrator. There is no unattended path, and inventing one would mean holding tenant credentials in a config file." })
+      ]) +
+
+      /* The one fact about PKCS that is invisible from the CA and that people get
+         wrong, the way the three-slot ceiling is the one for SCEP. */
+      warnBox("<strong>PKCS connectors are a pool, not a pair.</strong> Any connector in the tenant that supports PKCS can pick up any " +
+        "PKCS request off the shared Intune queue, and Microsoft's wording is that it is <em>not possible to define which connector " +
+        "handles each request</em> - so every PKCS connector must hold the <strong>same</strong> permissions and be able to reach " +
+        "every CA named in any PKCS profile. If there is already a connector elsewhere, add this machine to its groups too, and add " +
+        "it to the group below. A mismatch fails requests at random depending on which connector took them.") +
+
+      (scepStandalone()
+        ? fieldText({ label: "Forest domain name", path: "adcs.shared.forestDomainName", rerender: true, spellcheck: false, required: true,
+            placeholder: "ad.lab.invalid",
+            hint: "The domain this member server is in, and what the issuing CA's FQDN in the profile is built from." })
+        : "") +
+
+      fieldText({ label: "Computer name", path: "adcs.scep.computerName", rerender: true, spellcheck: false, required: true,
+        placeholder: "pkcs-01",
+        invalid: !!String(scep.computerName || "").trim() &&
+          (!isNetbios(String(scep.computerName || "").trim()) || String(scep.computerName || "").trim().length > NETBIOS_MAX),
+        hint: internalFqdn
+          ? "A member server. Its computer account is what enrolls - internally it answers as <code>" + esc(internalFqdn) + "</code>."
+          : "A member server - never the issuing CA. Its <strong>computer account</strong> is the identity that enrolls." }) +
+
+      factSection("pkcs-group-facts", [
+        factRow({ name: "The group", value: PKCS_CONNECTOR_GROUP,
+          why: "One group for both templates and for the CA, because every PKCS connector in a tenant has to hold identical permissions - a group per template would model a distinction that cannot exist. The computer account goes in it; nothing is ever granted to the machine directly." }),
+        factRow({ name: "On each template", value: "Read and Enroll",
+          why: "And Domain Users removed, which Microsoft's guide has as a numbered step. The enrollment ACL is the entire control on these templates - there is no policy module and no signed challenge behind a PKCS request." }),
+        factRow({ name: "On the CA", value: "Request Certificates" + (scep.grantRevocation ? ", Issue and Manage Certificates" : ""),
+          why: "Request Certificates is what lets the connector submit at all. It normally rides on Authenticated Users and goes unnoticed - but this design can take that default away itself, and a CA tightened that far refuses the connector with an access denied that names nothing. Issue and Manage is revocation, and only that." })
+      ]) +
+    cardClose() +
+
+    renderPkcsTemplatePickerCard() +
+    renderPkcsProfileCard() +
+
+    /* One card per selected template, in catalogue order, exactly as SCEP mode does. */
+    pkcsTemplateChoices().filter(function (entry) {
+      return selected.indexOf(entry.id) !== -1;
+    }).map(function (entry) {
+      return renderScepTemplateCard(
+        state.adcs.issuing.templates.items.filter(function (item) { return item.id === entry.id; })[0]);
+    }).join("") +
+
+    cardOpen("key-material.svg", "Strong mapping and revocation", "Two settings whose absence fails months later",
+        '<span class="pill status ' + (scep.pkcs.sidExtension ? "on" : "warn") + '">' +
+          (scep.pkcs.sidExtension ? "SID extension on" : "SID extension off") + '</span>',
+        { key: "pkcs-hardening", defaultOpen: true }) +
+      toggleField({ label: "Write the SID security extension", path: "adcs.scep.pkcs.sidExtension", rerender: true,
+        sub: hintPair("Sets <code>EnableSidSecurityExtension</code> on the connector host and restarts its services.",
+          "KB5014754 strong mapping. <strong>No installer sets this</strong> - the default is off, certificates issue happily " +
+          "without it, and then a domain controller refuses to authenticate one. Needs connector <code>6.2406.0.1001</code> or " +
+          "later, which the run checks. This is the PKCS mechanism and it is not the SCEP one: a SCEP profile carries the SID as " +
+          "<code>URI={{OnPremisesSecurityIdentifier}}</code> in its subject alternative name, and putting that in a PKCS profile " +
+          "does nothing.") }) +
+
+      infoBox("<strong>It only covers identities synced from on-premises Active Directory.</strong> User certificates on every " +
+        "platform and device certificates on <em>Microsoft Entra hybrid joined</em> Windows get the extension; cloud-only users and " +
+        "Entra-joined-only devices get nothing, and under full enforcement that is an authentication denial with nothing on this " +
+        "side to see.") +
+
+      toggleField({ label: "Let Intune revoke certificates from this CA", path: "adcs.scep.grantRevocation", rerender: true,
+        sub: "Adds <strong>Issue and Manage Certificates</strong> to the connector group's permission on the CA. Off, Intune can " +
+          "issue through this connector for ever and never revoke one." }) +
+
+      (scep.pkcs.sidExtension
+        ? factSection("pkcs-sid-facts", [
+            factRow({ name: "Written to", value: "HKLM\\SOFTWARE\\Microsoft\\MicrosoftIntune\\PFXCertificateConnector",
+              why: "Value <code>EnableSidSecurityExtension</code>, REG_DWORD 1. The key is created by the connector installer, so a run on a server where the connector is not installed yet reports this as outstanding and picks it up when the tier is run again." }),
+            factRow({ name: "Then restarts", value: "The two connector services",
+              why: "<em>PFX Create Certificate Connector for Microsoft Intune</em> and the legacy one beside it. The value is read at service start, so writing it without the restart changes nothing until somebody reboots." })
+          ])
+        : "") +
+    cardClose();
 }
 
 function renderScep() {
@@ -26531,9 +27388,11 @@ function renderScep() {
         '<h3>' + ((blockedByAcme || blockedByMode)
           ? "This cannot be part of the current design"
           : "The Intune Certificate Connector is not in this design") + '</h3>' +
-        '<p>A member server running the Network Device Enrollment Service, so Intune can hand certificates to devices that never ' +
-          'touch the domain. <strong>It needs no role ticked</strong> - build it alongside a new PKI, or bolt it onto a CA that ' +
-          'already exists and let this design describe nothing but the connector.</p>' +
+        '<p>A member server that hands Intune certificates for devices which never touch the domain. It opens in <strong>PKCS</strong>, ' +
+          'where the connector asks the CA directly - no NDES, no IIS, no endpoint published to the internet and no ceiling on how many ' +
+          'templates it serves. <strong>SCEP</strong> is the other tab, for when something needs that protocol. ' +
+          '<strong>It needs no role ticked</strong> - build it alongside a new PKI, or bolt it onto a CA that already exists and let ' +
+          'this design describe nothing but the connector.</p>' +
         (blockedByAcme
           ? warnBox("The <strong>Let's Encrypt certificate</strong> role is selected, and that one is the whole design or none of " +
               "it - it writes its own certificate section. Clear it first.") +
@@ -26553,6 +27412,11 @@ function renderScep() {
       '</div>';
   }
 
+  /* PKCS is a mode of its own and shares nothing below this line. Isolated the same
+     way the S2D cluster mode is: its own body, its own cards, and the SCEP path is
+     not altered by its existence. */
+  if (scepPkcsMode()) { return renderConnectorPkcs(); }
+
   const account = scep.serviceAccount;
   const source = scep.certificate.source;
   const internalFqdn = derivedScepInternalFqdn();
@@ -26564,6 +27428,8 @@ function renderScep() {
       'Microsoft\'s placement rules make it its own box: the connector is not supported on the issuing CA, and NDES must not run on a ' +
       'domain controller. <strong>Everything this role needs is on this blade</strong>, and it can be built with the PKI or bolted ' +
       'onto one that already exists.') + '</div>' +
+
+    renderConnectorTabs() +
 
     (acmeRenewalEnabled()
       ? warnBox("The <a href=\"#\" data-goto=\"acme\">Let's Encrypt certificate</a> role is selected, and that one is the whole design " +
@@ -27109,6 +27975,42 @@ function renderScepRunbook() {
   });
 }
 
+/* The PKCS runbook. Three machines and four stops, one fewer than SCEP because there
+   is no install-then-reboot-then-configure pair: this mode installs nothing. */
+function renderPkcsRunbook() {
+  return runbookCard({
+    key: "pkcs",
+    meta: "Three machines, three runs, and one install by hand",
+    badge: adcsAdoptMode() ? "Onto an adopted CA" : "With the PKI, or later",
+    stops: [
+      { icon: "active-directory.svg", where: "A domain controller",
+        what: "The directory run creates <code>" + esc(PKCS_CONNECTOR_GROUP) + "</code> and puts this connector's " +
+          "<strong>computer account</strong> in it. There is no service account in this mode - the connector runs as SYSTEM and " +
+          "reaches the CA as the machine." },
+      { icon: "issuing-ca.svg", where: "The issuing CA",
+        what: "The normal run publishes the PKCS templates with Read and Enroll for that group, and writes the group's permissions " +
+          "on the CA itself - <em>Request Certificates</em>, and <em>Issue and Manage Certificates</em> when revocation is on." },
+      { icon: "cert-connector.svg", where: "This connector server",
+        what: "The run <strong>installs nothing</strong>. It checks the prerequisites the connector has - Desktop Experience, " +
+          ".NET, Enhanced Security Configuration off, and whether this server trusts the CA's chain at all - confirms the templates " +
+          "are published, and sets the SID security extension once the connector is there.",
+        note: infoBox("No features, so no reboot boundary and no resume task in this mode. The SCEP mode is one of the three places " +
+          "in this project a run installs anything; that exception belongs to NDES and does not travel with the tier.") },
+      { icon: "your-decision.svg", where: "The Certificate Connector for Microsoft Intune", kind: "manual",
+        what: "Install it on this server by hand, then <strong>run this config again</strong> so the SID extension can be written. " +
+          "Tick <strong>PKCS</strong>, leave the service account on <strong>SYSTEM</strong>, and sign in as an " +
+          "<strong>Intune Administrator with a licence</strong>. There is no unattended path." }
+    ],
+    after:
+      infoBox("<strong>Both orders work, because every tier dispatches by computer name.</strong> Put this blade in the same design " +
+        "as the CA and one config builds the lot in order; or come back later, tick it on a design whose CA already exists, and run " +
+        "only the parts that changed. Every run above is idempotent.") +
+      warnBox("<strong>Any PKCS connector in the tenant can take any PKCS request.</strong> Microsoft's rule is that it is not " +
+        "possible to decide which one handles which, so every PKCS connector must hold the same permissions and be able to reach " +
+        "every CA named in any profile. If one already exists elsewhere, the two have to match or requests fail at random.")
+  });
+}
+
 /* ---------------------------[ Blade: Passwords ]--------------------------- */
 /* Every secret this design carries, in one place. The point is not storage - they all
    live in their own blades and in config.json - it is that an account this studio
@@ -27158,7 +28060,10 @@ function credentialRows() {
       generated: true,
       why: "Authenticates the two partners to each other. The same value goes on both." });
   }
-  if (scepEnabled() && state.adcs.scep.serviceAccount.enabled !== false) {
+  /* PKCS mode has no service account: the connector runs as SYSTEM and reaches the CA
+     as the machine. A password field for an account nothing creates is a question with
+     no right answer. */
+  if (scepEnabled() && !scepPkcsMode() && state.adcs.scep.serviceAccount.enabled !== false) {
     rows.push({ id: "scep", icon: "cert-connector.svg", owner: "NDES service account", kind: "account",
       where: "created on the domain controller", user: state.adcs.scep.serviceAccount.samAccountName || "",
       path: "adcs.scep.serviceAccount.password", value: state.adcs.scep.serviceAccount.password,
@@ -29805,6 +30710,16 @@ function wireMain() {
       render();
       return;
     }
+    const connectorModeTab = event.target.closest("[data-connector-mode]");
+    if (connectorModeTab) {
+      state.adcs.scep.connectorMode = connectorModeTab.dataset.connectorMode;
+      /* The other mode's templates stop being built the moment the mode changes -
+         otherwise a design that was SCEP for five minutes publishes its templates
+         for ever. */
+      syncScepTemplateSelection();
+      render();
+      return;
+    }
     const fsModeTab = event.target.closest("[data-fs-mode]");
     if (fsModeTab) {
       state.fs.mode = fsModeTab.dataset.fsMode;
@@ -30217,6 +31132,12 @@ function wireMain() {
     const scepTemplateToggle = event.target.closest("[data-scep-template]");
     if (scepTemplateToggle) {
       scepToggleTemplate(scepTemplateToggle.dataset.scepTemplate);
+      render();
+      return;
+    }
+    const pkcsTemplateToggle = event.target.closest("[data-pkcs-template]");
+    if (pkcsTemplateToggle) {
+      pkcsToggleTemplate(pkcsTemplateToggle.dataset.pkcsTemplate);
       render();
       return;
     }

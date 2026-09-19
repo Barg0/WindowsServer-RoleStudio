@@ -147,6 +147,206 @@ if ($enableLogFile -and (Test-Path -LiteralPath $script:logRoot)) {
 }
 
 # ---------------------------[ Logging Function ]---------------------------
+
+# =====================================================================================
+# Kaido Dark, the studio's default theme, as the console's palette.
+#
+# Every hex is lifted verbatim from FAMILIES[kaido].dark in the studio HTML - with one
+# stated exception, `yellow`, which the studio has no counterpart for and which is
+# documented where it is defined. A run and the studio that designed it are otherwise
+# the same colours rather than two guesses at them.
+# Truecolor where the console does virtual terminal processing, the nearest named colour
+# where it does not.
+#
+# It lives in THIS file rather than in ConsoleUi.ps1 because Logging.ps1 is the first
+# part the entry script dot-sources and Write-Log is called while the others are still
+# loading: a palette defined in the last part would be undefined for the first lines of
+# every run. Everything that reaches the screen goes through Write-Studio, which is what
+# makes the theme one table instead of ninety scattered -ForegroundColor arguments.
+# =====================================================================================
+$script:menuConsoleType = $null
+$script:menuVtEnabled = $false
+
+$script:studioPalette = @{
+    bg       = "#16171e"; elevated  = "#1d1f28"; subtle = "#1a1c24"; hover = "#262a38"
+    fg       = "#d7dbec"; muted     = "#8b93ad"
+    border   = "#2b2f3d"; borderStrong = "#3d4356"; divider = "#23262f"
+    accent   = "#7aa2f7"; accentHover = "#93b3fa"; accentSoft = "#22304f"; accentFg = "#11141c"
+    success  = "#9ece6a"; danger    = "#f7768e"; warn = "#e0af68"
+    bandHost = "#7dcfff"; bandIdent = "#bb9af7"; bandWork = "#9ece6a"; bandDeploy = "#ff9e64"
+    # THE ONE VALUE IN THIS TABLE THAT IS NOT THE STUDIO'S.
+    #
+    # Kaido has exactly two warm colours - warn #e0af68, a gold, and deploy #ff9e64, an
+    # orange - and a log needs three warm steps, because `info` is the commonest tag
+    # there is and it has to sit below `warn` without either of them reading as the
+    # other. Mapping info onto the gold put the two one step apart and the pair read as
+    # orange-on-orange; mapping info onto the plain text colour was tried in an earlier
+    # build and the log came out undifferentiated.
+    #
+    # So this is a console-only colour, chosen to be the yellow the gold is not, and it
+    # is written down here rather than being quietly one more entry: everything else in
+    # this table can be checked against FAMILIES[kaido].dark in the studio HTML and this
+    # cannot. It has no studio counterpart and needs none - the studio has no log.
+    #
+    # Pick it by HUE, not by eye. The first attempt at this value was #f0d080, which
+    # looks yellow written down and sits at 43 degrees - seven degrees off Kaido's gold
+    # and still inside the amber band, so the log read exactly as orange as before.
+    # 30 degrees is orange, 45 gold, 60 pure yellow; this is 56, which is far enough
+    # from warn's 35 to separate at a glance and short of the acid-lemon end.
+    yellow   = "#e6de78"
+}
+
+# One per key, for a console that cannot do truecolor. Chosen for the JOB the hex does,
+# not the nearest RGB: muted and borderStrong both land on DarkGray because both are
+# "quieter than the text", and that is what has to survive.
+$script:studioFallback = @{
+    bg       = "Black";    elevated  = "Black";  subtle = "Black";     hover = "Black"
+    fg       = "Gray";     muted     = "DarkGray"
+    border   = "DarkGray"; borderStrong = "DarkGray"; divider = "DarkGray"
+    accent   = "Cyan";     accentHover = "White"; accentSoft = "DarkBlue"; accentFg = "Black"
+    success  = "Green";    danger    = "Red";     warn = "DarkYellow"
+    bandHost = "Cyan";     bandIdent = "Magenta"; bandWork = "Green";   bandDeploy = "Yellow"
+    # Yellow against warn's DarkYellow, which is the pair the sixteen-colour version of
+    # this log used for exactly the same reason - the truecolor palette had to grow a
+    # third warm step to say what ConsoleColor could already say with two.
+    yellow   = "Yellow"
+}
+
+function Get-MenuConsoleType {
+    # The one P/Invoke surface the console UI needs: virtual terminal processing, and
+    # the screen buffer's extended info, which is the only place the console's real
+    # background colour is written down. Added once per session and cached - a resume
+    # run dot-sources these parts a second time into a session where the type already
+    # exists, and Add-Type would throw rather than return it.
+    if ($script:menuConsoleType) { return $script:menuConsoleType }
+
+    $existing = "WsrsRoles.WsrsVtConsole" -as [type]
+    if ($existing) {
+        $script:menuConsoleType = $existing
+        return $script:menuConsoleType
+    }
+
+    try {
+        $added = Add-Type -MemberDefinition @"
+[StructLayout(LayoutKind.Sequential)]
+public struct WsrsCoord { public short X; public short Y; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WsrsSmallRect { public short Left; public short Top; public short Right; public short Bottom; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WsrsBufferInfoEx {
+    public int cbSize;
+    public WsrsCoord dwSize;
+    public WsrsCoord dwCursorPosition;
+    public ushort wAttributes;
+    public WsrsSmallRect srWindow;
+    public WsrsCoord dwMaximumWindowSize;
+    public ushort wPopupAttributes;
+    public bool bFullscreenSupported;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public uint[] ColorTable;
+}
+
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool GetConsoleScreenBufferInfoEx(IntPtr hConsoleOutput, ref WsrsBufferInfoEx lpInfo);
+"@ -Name WsrsVtConsole -Namespace WsrsRoles -PassThru -ErrorAction Stop
+
+        $script:menuConsoleType = @($added) | Where-Object { $_.Name -eq "WsrsVtConsole" } | Select-Object -First 1
+    }
+    catch {
+        # Older hosts, or a host with no console at all: every caller falls back
+        $script:menuConsoleType = $null
+    }
+
+    return $script:menuConsoleType
+}
+
+function Enable-MenuVtProcessing {
+    # Turns on virtual terminal processing so truecolor ANSI renders on
+    # conhost-based Windows consoles. Safe no-op everywhere else.
+    if ($script:menuVtEnabled) { return }
+    $script:menuVtEnabled = $true
+
+    try {
+        $vt = Get-MenuConsoleType
+        if ($null -eq $vt) { return }
+        $handle = $vt::GetStdHandle(-11)
+        $mode = [uint32]0
+        if ($vt::GetConsoleMode($handle, [ref]$mode)) {
+            [void]$vt::SetConsoleMode($handle, ($mode -bor 0x4))
+        }
+    }
+    catch {
+        # Older hosts without VT support fall back to the plain ASCII logo
+    }
+}
+
+function Test-MenuAnsiSupported {
+    try {
+        if ($env:NO_COLOR) { return $false }
+        if ($Host.UI.SupportsVirtualTerminal) { return $true }
+        if ($env:WT_SESSION -or $env:TERM_PROGRAM -or $env:TERM) { return $true }
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-MenuHostSupported {
+    try {
+        if ($null -eq $Host -or $null -eq $Host.UI -or $null -eq $Host.UI.RawUI) { return $false }
+        if ($Host.Name -match "ISE") { return $false }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function ConvertFrom-HexColor {
+    param([string]$Hex)
+
+    $h = $Hex.TrimStart("#")
+    return @(
+        [Convert]::ToInt32($h.Substring(0, 2), 16),
+        [Convert]::ToInt32($h.Substring(2, 2), 16),
+        [Convert]::ToInt32($h.Substring(4, 2), 16)
+    )
+}
+
+function Write-Studio {
+    param(
+        [AllowEmptyString()][string]$Text = "",
+        [string]$Key = "fg",
+        [switch]$NoNewline
+    )
+
+    $hex = [string]$script:studioPalette[$Key]
+    if ([string]::IsNullOrWhiteSpace($hex)) { $hex = [string]$script:studioPalette["fg"] }
+
+    # Cheap after the first call - Enable-MenuVtProcessing caches - and it has to be
+    # here rather than only in the menu header, because log lines print long before any
+    # header does.
+    Enable-MenuVtProcessing
+    if (Test-MenuAnsiSupported) {
+        $rgb = ConvertFrom-HexColor -Hex $hex
+        $escape = [char]27
+        Write-Host ("{0}[38;2;{1};{2};{3}m{4}{0}[0m" -f $escape, $rgb[0], $rgb[1], $rgb[2], $Text) -NoNewline:$NoNewline
+        return
+    }
+
+    $named = [string]$script:studioFallback[$Key]
+    if ([string]::IsNullOrWhiteSpace($named)) { $named = "Gray" }
+    Write-Host $Text -NoNewline:$NoNewline -ForegroundColor $named
+}
+
 function Write-Log {
     [CmdletBinding()]
     param (
@@ -191,20 +391,23 @@ function Write-Log {
     if ([string]::IsNullOrWhiteSpace($shown)) { $shown = "error" }
     $rawTag = $shown.PadRight(5)
 
+    # Palette keys, not ConsoleColor names - see Write-Studio above. The pairing this
+    # has to preserve is info BELOW warn: info is the commonest tag in any run, warn is
+    # the one that wants to be noticed, and the two are adjacent everywhere on screen.
+    # Kaido's own two warm colours are one step apart, which read as orange-on-orange,
+    # so the palette carries a third - `yellow`, the only value in it that is not the
+    # studio's. info takes it and warn keeps Kaido's gold.
     $color = switch ($shown) {
-        "start" { "Cyan" }
-        "get"   { "Blue" }
-        "run"   { "Magenta" }
-        "info"  { "Yellow" }
-        # There is no orange in ConsoleColor. DarkYellow is ANSI 3, which every current
-        # scheme renders orange-brown (Campbell #C19C00), against info's Yellow = ANSI 11,
-        # the pale bright one - so warn reads as the louder of the two, not the dimmer.
-        "warn"  { "DarkYellow" }
-        "o.k."  { "Green" }
-        "error" { "Red" }
-        "debug" { "DarkGray" }
-        "end"   { "Cyan" }
-        default { "White" }
+        "start" { "accent" }
+        "get"   { "bandHost" }
+        "run"   { "bandIdent" }
+        "info"  { "yellow" }
+        "warn"  { "warn" }
+        "o.k."  { "success" }
+        "error" { "danger" }
+        "debug" { "muted" }
+        "end"   { "accent" }
+        default { "fg" }
     }
 
     # Square brackets, like the tag beside it. Round ones were a second punctuation style
@@ -247,11 +450,14 @@ function Write-Log {
         }
     }
 
-    Write-Host "$timestamp " -NoNewline
-    Write-Host "[ " -NoNewline -ForegroundColor White
-    Write-Host "$rawTag" -NoNewline -ForegroundColor $color
-    Write-Host " ] " -NoNewline -ForegroundColor White
-    Write-Host "$scope$Message"
+    # The timestamp is secondary information on every line, so it takes the muted key
+    # rather than the host's default foreground - the one place this port changes what
+    # a line looks like rather than only what it is drawn with.
+    Write-Studio -Text "$timestamp " -Key "muted" -NoNewline
+    Write-Studio -Text "[ " -Key "muted" -NoNewline
+    Write-Studio -Text "$rawTag" -Key $color -NoNewline
+    Write-Studio -Text " ] " -Key "muted" -NoNewline
+    Write-Studio -Text "$scope$Message" -Key "fg"
 }
 
 # ---------------------------[ Error detail ]---------------------------

@@ -2407,23 +2407,23 @@ function Write-HypervSwitchPanel {
         [object[]]$Existing = @()
     )
 
-    Write-Host "  Planned in this run" -ForegroundColor White
+    Write-Studio -Text "  Planned in this run" -Key "fg"
     if ($Planned.Count -eq 0) {
-        Write-Host "    nothing yet" -ForegroundColor DarkGray
+        Write-Studio -Text "    nothing yet" -Key "muted"
     }
     else {
         foreach ($definition in $Planned) {
-            Write-Host ("    " + (Get-HypervSwitchLine -Definition $definition)) -ForegroundColor Cyan
+            Write-Studio -Text ("    " + (Get-HypervSwitchLine -Definition $definition)) -Key "accent"
         }
     }
     Write-Host ""
 
     if ($Existing.Count -gt 0) {
-        Write-Host "  Already on this host" -ForegroundColor White
+        Write-Studio -Text "  Already on this host" -Key "fg"
         foreach ($item in $Existing) {
             $detail = "adopted, left exactly as it is"
             if ($item.AdapterNames.Count -gt 0) { $detail = ($item.AdapterNames -join " + ") + " - adopted, left exactly as it is" }
-            Write-Host ("    {0,-20} {1,-9} {2}" -f $item.Name, $item.Type, $detail) -ForegroundColor DarkGray
+            Write-Studio -Text ("    {0,-20} {1,-9} {2}" -f $item.Name, $item.Type, $detail) -Key "muted"
         }
         Write-Host ""
     }
@@ -2741,15 +2741,15 @@ function Write-HypervPlanSummary {
     $clustered = Test-HypervClusterWanted -Hyperv $Hyperv
     $storage = $Plan.storage
 
-    Write-Host "  Storage" -ForegroundColor White
+    Write-Studio -Text "  Storage" -Key "fg"
     if ($null -eq $storage) {
-        Write-Host "    nothing is prepared - virtual machines land where Hyper-V's defaults put them" -ForegroundColor DarkGray
+        Write-Studio -Text "    nothing is prepared - virtual machines land where Hyper-V's defaults put them" -Key "muted"
     }
     else {
         if ((-not $clustered) -and ($null -ne $storage.pool)) {
             $copies = [int]$storage.pool.copies
             $layout = if ([string]$storage.pool.resiliency -eq "Mirror") { "$copies-way mirror" } else { [string]$storage.pool.resiliency }
-            Write-Host ("    pool           {0}   {1}   {2} disk(s)" -f $storage.pool.name, $layout, @($storage.pool.disks).Count) -ForegroundColor Cyan
+            Write-Studio -Text ("    pool           {0}   {1}   {2} disk(s)" -f $storage.pool.name, $layout, @($storage.pool.disks).Count) -Key "accent"
         }
         if ($clustered) {
             $cluster = Get-HypervClusterSection -Hyperv $Hyperv
@@ -2774,28 +2774,28 @@ function Write-HypervPlanSummary {
                 $shape = if ($copies -le 1) { "no resiliency" } else { "{0} copies across disks" -f $copies }
 
                 if ($disks.Count -gt 0) {
-                    Write-Host ("    pool           {0}   {1} disk(s), Storage Spaces Direct, {2}" -f $poolName, $disks.Count, $shape) -ForegroundColor Cyan
-                    Write-Host ("                   disks {0} - left empty until the cluster claims them" -f ($disks -join ", ")) -ForegroundColor DarkGray
+                    Write-Studio -Text ("    pool           {0}   {1} disk(s), Storage Spaces Direct, {2}" -f $poolName, $disks.Count, $shape) -Key "accent"
+                    Write-Studio -Text ("                   disks {0} - left empty until the cluster claims them" -f ($disks -join ", ")) -Key "muted"
                     if ($copies -le 1) {
-                        Write-Host "                   nothing protects these volumes - one disk failure loses every virtual machine" -ForegroundColor Yellow
+                        Write-Studio -Text "                   nothing protects these volumes - one disk failure loses every virtual machine" -Key "warn"
                     }
                 }
                 else {
-                    Write-Host "    pool           no disk chosen - the cluster will have nothing to build on" -ForegroundColor DarkGray
+                    Write-Studio -Text "    pool           no disk chosen - the cluster will have nothing to build on" -Key "muted"
                 }
-                Write-Host ("    volumes        {0}   ReFS {1}, carved out of that one pool" -f ($names -join ", "), $unit) -ForegroundColor Cyan
+                Write-Studio -Text ("    volumes        {0}   ReFS {1}, carved out of that one pool" -f ($names -join ", "), $unit) -Key "accent"
             }
             else {
-                Write-Host ("    volumes        {0}   {1} {2}, no drive letter" -f ($names -join ", "),
-                    (Get-ConfigText -InputObject $cluster -Name "fileSystem" -Default "NTFS"), $unit) -ForegroundColor Cyan
+                Write-Studio -Text ("    volumes        {0}   {1} {2}, no drive letter" -f ($names -join ", "),
+                    (Get-ConfigText -InputObject $cluster -Name "fileSystem" -Default "NTFS"), $unit) -Key "accent"
                 if ($disks.Count -gt 0) {
                     for ($index = 0; $index -lt $disks.Count; $index++) {
                         $name = if ($index -lt $names.Count) { $names[$index] } else { "(spare)" }
-                        Write-Host ("    {0,-14} disk {1}, taken whole" -f $name, $disks[$index]) -ForegroundColor Cyan
+                        Write-Studio -Text ("    {0,-14} disk {1}, taken whole" -f $name, $disks[$index]) -Key "accent"
                     }
                 }
                 else {
-                    Write-Host "    disks          none chosen - the cluster will have nothing to hand out" -ForegroundColor DarkGray
+                    Write-Studio -Text "    disks          none chosen - the cluster will have nothing to hand out" -Key "muted"
                 }
             }
             # The one destructive thing this run can do, on the screen that asks whether
@@ -2804,10 +2804,10 @@ function Write-HypervPlanSummary {
             $wipe = @()
             try { $wipe = @($storage.clusterDiskWipe | Where-Object { $null -ne $_ }) } catch { $wipe = @() }
             if ($wipe.Count -gt 0) {
-                Write-Host ("    erases         disk {0} - every partition and file on {1} is destroyed" -f
-                    ($wipe -join ", "), $(if ($wipe.Count -eq 1) { "it" } else { "them" })) -ForegroundColor Yellow
+                Write-Studio -Text ("    erases         disk {0} - every partition and file on {1} is destroyed" -f
+                    ($wipe -join ", "), $(if ($wipe.Count -eq 1) { "it" } else { "them" })) -Key "warn"
             }
-            Write-Host ("    cluster        {0}, one node" -f (Get-HypervClusterName -Cluster $cluster)) -ForegroundColor Cyan
+            Write-Studio -Text ("    cluster        {0}, one node" -f (Get-HypervClusterName -Cluster $cluster)) -Key "accent"
         }
         else {
             $section = Get-ConfigValue -InputObject $Hyperv -Name "storage"
@@ -2816,42 +2816,42 @@ function Write-HypervPlanSummary {
             try { $bytes = [long]$storage.partitionSizeBytes } catch { $bytes = 0 }
             if ($bytes -gt 0) { $size = "{0} GB of it" -f [math]::Round($bytes / 1GB) }
             $disk = if ([int]$storage.diskNumber -ge 0) { "disk $([int]$storage.diskNumber), $size" } else { "the single free disk" }
-            Write-Host ("    volume         {0}:   {1} {2}   from {3}" -f $storage.driveLetter,
+            Write-Studio -Text ("    volume         {0}:   {1} {2}   from {3}" -f $storage.driveLetter,
                 (Get-ConfigText -InputObject $section -Name "fileSystem" -Default "ReFS"),
-                (Get-ConfigValue -InputObject $section -Name "allocationUnitSize" -Default 4096), $disk) -ForegroundColor Cyan
+                (Get-ConfigValue -InputObject $section -Name "allocationUnitSize" -Default 4096), $disk) -Key "accent"
         }
     }
     Write-Host ""
 
-    Write-Host "  Networking" -ForegroundColor White
+    Write-Studio -Text "  Networking" -Key "fg"
     $switches = @($Plan.switches)
     if ($switches.Count -eq 0) {
-        Write-Host "    no switch is built" -ForegroundColor DarkGray
+        Write-Studio -Text "    no switch is built" -Key "muted"
     }
     else {
         foreach ($definition in $switches) {
-            Write-Host ("    " + (Get-HypervSwitchLine -Definition $definition)) -ForegroundColor Cyan
+            Write-Studio -Text ("    " + (Get-HypervSwitchLine -Definition $definition)) -Key "accent"
         }
     }
     Write-Host ""
 
     if ($null -ne $Plan.appCompat) {
-        Write-Host "  App Compatibility" -ForegroundColor White
+        Write-Studio -Text "  App Compatibility" -Key "fg"
         $mode = [string]$Plan.appCompat.mode
         $where = switch ($mode) {
             "online" { "from Windows Update" }
             "iso"    { "from '" + [string]$Plan.appCompat.isoPath + "'" }
             default  { "left out" }
         }
-        Write-Host ("    {0}" -f $where) -ForegroundColor Cyan
+        Write-Studio -Text ("    {0}" -f $where) -Key "accent"
         Write-Host ""
     }
 
     if (Test-HypervDomainJoinWanted -Hyperv $Hyperv) {
         $join = Get-HypervDomainJoinSection -Hyperv $Hyperv
-        Write-Host "  Domain join" -ForegroundColor White
-        Write-Host ("    {0}   as {1}" -f (Get-ConfigText -InputObject $join -Name "domain" -Default "?"),
-            (Get-ConfigText -InputObject $join -Name "joinUser" -Default "?")) -ForegroundColor Cyan
+        Write-Studio -Text "  Domain join" -Key "fg"
+        Write-Studio -Text ("    {0}   as {1}" -f (Get-ConfigText -InputObject $join -Name "domain" -Default "?"),
+            (Get-ConfigText -InputObject $join -Name "joinUser" -Default "?")) -Key "accent"
         Write-Host ""
     }
 }

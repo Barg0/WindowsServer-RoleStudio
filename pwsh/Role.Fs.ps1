@@ -461,9 +461,9 @@ $script:fsDiskChoice = @()
 function Write-FsDiskChoice {
     if ($script:fsDiskChoice.Count -eq 0) { return }
     Write-Host ""
-    Write-Host "  Already assigned" -ForegroundColor DarkCyan
+    Write-Studio -Text "  Already assigned" -Key "accent"
     foreach ($line in $script:fsDiskChoice) {
-        Write-Host ("    " + $line) -ForegroundColor Gray
+        Write-Studio -Text ("    " + $line) -Key "fg"
     }
     Write-Host ""
 }

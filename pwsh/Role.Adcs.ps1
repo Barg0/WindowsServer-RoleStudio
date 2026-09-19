@@ -69,11 +69,38 @@ function ConvertTo-AdcsWebFileName {
 # The directory tier is deliberately last - a machine named as both a CA and the
 # directory tier is a mistake the studio calls out, and being a CA is the answer that
 # does not silently skip building one.
+# The connector tier was written as `scep` before it had a second mode and is written
+# as `intuneConnector` now. Both are read, the new one first, so a config.json from an
+# earlier build still runs unchanged - there is no migration step and nothing rewrites
+# the old file. The TIER NAME stays "scep" throughout the engine: it is what the plan,
+# the summary and every existing branch key off, and renaming it would be a rename of
+# the run rather than of a config key.
+function Get-AdcsTierSection {
+    param([object]$CertificateServices, [Parameter(Mandatory)][string]$TierName)
+
+    if ($TierName -eq "scep") {
+        $connector = Get-ConfigValue -InputObject $CertificateServices -Name "intuneConnector"
+        if ($null -ne $connector) { return $connector }
+    }
+    return (Get-ConfigValue -InputObject $CertificateServices -Name $TierName)
+}
+
+# scep or pkcs. Absent means a config written before the second mode existed, and every
+# one of those is a SCEP design.
+function Get-AdcsConnectorMode {
+    param([object]$CertificateServices)
+
+    $connector = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName "scep"
+    $mode = [string](Get-ConfigText -InputObject $connector -Name "connectorMode" -Default "scep")
+    if ($mode.Equals("pkcs", [System.StringComparison]::OrdinalIgnoreCase)) { return "pkcs" }
+    return "scep"
+}
+
 function Resolve-AdcsTier {
     param([object]$CertificateServices)
 
     foreach ($tierName in @("root", "issuing", "scep", "directory")) {
-        $tier = Get-ConfigValue -InputObject $CertificateServices -Name $tierName
+        $tier = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName $tierName
         if ($null -eq $tier) { continue }
         $name = [string](Get-ConfigText -InputObject $tier -Name "computerName" -Default "")
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
@@ -375,7 +402,7 @@ function Set-AdcsPublicationUrl {
 
     $shared     = Get-ConfigValue -InputObject $CertificateServices -Name "shared"
     $pkiBaseUrl = ([string](Get-ConfigValue -InputObject $shared -Name "pkiBaseUrl" -Default "")).TrimEnd("/")
-    $tier       = Get-ConfigValue -InputObject $CertificateServices -Name $TierName
+    $tier       = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName $TierName
     $crl        = Get-ConfigValue -InputObject $tier -Name "crl"
     $deltaUnits = [int](Get-ConfigValue -InputObject $crl -Name "deltaPeriodUnits" -Default 0)
 
@@ -458,7 +485,7 @@ function Set-AdcsAuthorityConfiguration {
     )
 
     $shared = Get-ConfigValue -InputObject $CertificateServices -Name "shared"
-    $tier   = Get-ConfigValue -InputObject $CertificateServices -Name $TierName
+    $tier   = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName $TierName
     $crl    = Get-ConfigValue -InputObject $tier -Name "crl"
 
     # An offline root has never seen the domain, so the %6 in an LDAP path has
@@ -847,6 +874,100 @@ function Export-AdcsRootMaterial {
     return $exported
 }
 
+# The request id out of `certreq -submit`, WITHOUT reading the label.
+#
+# certreq writes its labels in the server's display language. An English server says
+#
+#     RequestId: 5
+#     RequestId: "5"
+#     Certificate request is pending: Taken Under Submission (0)
+#
+# and a German one says
+#
+#     Anforderungs-ID: 5
+#     Anforderungs-ID: "5"
+#     Ausstehende Zertifikatanforderung: Bei Uebermittlung (0)
+#
+# Matching "RequestId:" therefore failed on a German root CA and took the whole PKI
+# build down at the first submit - field-hit 2026-09-19, the first time this project
+# was run on a non-English forest. Same class of bug as matching "Authenticated Users"
+# by name instead of by SID, and the same rule applies: read the SHAPE, not the word.
+#
+# The shape is stable across locales - a label, a colon, and the id alone on the line,
+# printed twice, bare and then quoted. The pending line that follows never matches,
+# because its value ends in "(0)" rather than in digits. The English label is still
+# tried first so an English server takes a deterministic path and any surprise here
+# shows up as the fallback being used rather than as a different answer.
+# The NextUpdate out of `certutil -dump <crl>`, also without reading the label - a
+# German server prints "Naechste Aktualisierung" where an English one prints
+# "NextUpdate". The shape here is weaker than the request id's, because the value is a
+# date rather than an integer, so this does both:
+#
+#   1. the English label when it is there, which is exact;
+#   2. otherwise every "label: value" line parsed as a date IN THE SERVER'S OWN
+#      CULTURE, taking the LATEST. A CRL dump carries ThisUpdate and NextUpdate and
+#      NextUpdate is by definition the later of the two, so the maximum is the one
+#      wanted whatever the two are called.
+#
+# TryParse with the current culture is what makes (2) work at all: "19.09.2026 20:04"
+# is not a date to an invariant parser and is one to a German server.
+function Get-AdcsCrlNextUpdateFromDump {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Dump)
+
+    # Three cultures, because the two that matter can disagree: certutil prints in the
+    # DISPLAY language (CurrentUICulture) while a date parses under the REGIONAL format
+    # (CurrentCulture), and a German-language server set to English formats - or the
+    # reverse - is an ordinary thing to find. Invariant last, for an ISO-ish value.
+    $cultures = @(
+        [System.Globalization.CultureInfo]::CurrentCulture,
+        [System.Globalization.CultureInfo]::CurrentUICulture,
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
+    $tryParse = {
+        param([string]$Text)
+        foreach ($culture in $cultures) {
+            $value = [datetime]::MinValue
+            if ([datetime]::TryParse($Text, $culture, [System.Globalization.DateTimeStyles]::None, [ref]$value)) {
+                return $value
+            }
+        }
+        return $null
+    }
+
+    $anchored = [regex]::Match($Dump, "NextUpdate:\s*(.+)")
+    if ($anchored.Success) {
+        $exact = & $tryParse $anchored.Groups[1].Value.Trim()
+        if ($null -ne $exact) { return $exact }
+    }
+
+    $latest = $null
+    foreach ($line in ($Dump -split "`r?`n")) {
+        $pair = [regex]::Match($line, '^[^\r\n:]*:\s*(?<value>\S.*)$')
+        if (-not $pair.Success) { continue }
+        $parsed = & $tryParse $pair.Groups["value"].Value.Trim()
+        if ($null -eq $parsed) { continue }
+        if (($null -eq $latest) -or ($parsed -gt $latest)) { $latest = $parsed }
+    }
+    if ($null -ne $latest) {
+        Write-Log "certutil did not print an English NextUpdate - the CRL's latest date was used instead" -Tag "Debug"
+    }
+    return $latest
+}
+
+function Get-AdcsSubmittedRequestId {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$SubmitOutput)
+
+    $anchored = [regex]::Match($SubmitOutput, "RequestId:\s*`"?(\d+)`"?")
+    if ($anchored.Success) { return $anchored.Groups[1].Value }
+
+    $shaped = [regex]::Match($SubmitOutput, '(?m)^[^\r\n:]*:\s*"?(\d+)"?\s*$')
+    if ($shaped.Success) {
+        Write-Log "certreq did not print an English label - the request id was read by shape" -Tag "Debug"
+        return $shaped.Groups[1].Value
+    }
+    return ""
+}
+
 # A standalone CA parks incoming requests as pending. Issuing one from the console
 # is the step every guide has you click through; this is the same three calls.
 function New-AdcsIssuedCertificate {
@@ -858,11 +979,10 @@ function New-AdcsIssuedCertificate {
     $configString = Get-AdcsConfigString
     $submitOutput = Invoke-AdcsUtility -FilePath "certreq.exe" -ArgumentList @("-config", $configString, "-submit", $RequestPath) -IgnoreExitCode
 
-    $match = [regex]::Match($submitOutput, "RequestId:\s*(\d+)")
-    if (-not $match.Success) {
-        throw "Could not read a RequestId out of the certreq output: $submitOutput"
+    $requestId = Get-AdcsSubmittedRequestId -SubmitOutput $submitOutput
+    if ([string]::IsNullOrWhiteSpace($requestId)) {
+        throw "Could not read a request id out of the certreq output: $submitOutput"
     }
-    $requestId = $match.Groups[1].Value
     Write-Log "The request was taken as RequestId $requestId" -Tag "Info"
 
     $null = Invoke-AdcsUtility -FilePath "certutil.exe" -ArgumentList @("-resubmit", $requestId) -IgnoreExitCode
@@ -1256,7 +1376,9 @@ function Repair-AdcsChainedConfiguration {
     param([Parameter(Mandatory)][string]$Message)
 
     # appcmd names the file it choked on. '\\?\' is the long-path prefix it prints.
-    $match = [regex]::Match($Message, "Filename:\s*(?:\\\\\?\\)?(?<path>[A-Za-z]:\\[^\r\n]+)")
+    # The label is localised - "Dateiname:" on a German server - so the anchor is the
+    # drive-letter path itself, which is not. Same rule as the request id above.
+    $match = [regex]::Match($Message, "(?:Filename|Dateiname)?:?\s*(?:\\\\\?\\)?(?<path>[A-Za-z]:\\[^\r\n]+)")
     if (-not $match.Success) { return $false }
 
     $configPath = $match.Groups["path"].Value.Trim()
@@ -1676,6 +1798,15 @@ $script:ctFlagIncludeBasicConstraints = 0x00008000
 # and leaving this clear produces a template nothing ever enrolls for, silently - the
 # permission is there, the client just never asks.
 $script:ctFlagAutoEnrollment = 0x00000020
+
+# CT_FLAG_PUBLISH_TO_DS. The CA writes every issued certificate into the requester's
+# own directory object - the console's "Publish certificate in Active Directory". It
+# exists for encryption certificates other people have to find; an authentication
+# certificate published there is directory bloat and a list of everything this template
+# ever issued, readable by anyone who can read the object. Microsoft's PKCS guide says
+# to clear it explicitly, so the design states it rather than inheriting whichever
+# answer the source template happened to carry.
+$script:ctFlagPublishToDs = 0x00000008
 
 # CT_FLAG_NO_SECURITY_EXTENSION suppresses the SID extension on everything issued from
 # the template, which forces the weak UPN mapping KB5014754 exists to retire - ESC9. No
@@ -2232,6 +2363,13 @@ $script:adcsRoleAccessMask = @{
     "certificateManager" = 0x00000002
     "auditor"           = 0x00000104
     "backupOperator"    = 0x00000108
+    # CA_ACCESS_ENROLL - the console's "Request Certificates", which is what lets a
+    # principal submit at all. It is normally unstated because a default CA grants it
+    # to Authenticated Users and every computer account is one of those. It is stated
+    # here because this design can take that default away itself: applyCaSecurity
+    # rewrites the descriptor, and a CA tightened that far refuses the Intune
+    # connector with an access denied that names nothing.
+    "requester"         = 0x00000200
 }
 
 # BUILTIN\Administrators. The two domain ones are resolved per domain, by RID, the same
@@ -2350,7 +2488,14 @@ function Set-AdcsCaSecurity {
         return $false
     }
 
-    $applied = @()
+    # Every role a group is given is OR-ed into one mask before anything is written.
+    # A descriptor carries one ACE per principal and the ACE below replaces whatever
+    # that principal had, so two entries naming the same group would otherwise mean the
+    # last one read wins and the first right is silently dropped. One group holding two
+    # rights is not hypothetical: the Intune connector group needs Request Certificates
+    # to issue at all, and Issue and Manage Certificates as well once revocation is in
+    # the design.
+    $wanted = [ordered]@{}
     foreach ($group in $groups) {
         $role = [string](Get-ConfigText -InputObject $group -Name "role" -Default "")
         $name = [string](Get-ConfigText -InputObject $group -Name "name" -Default "")
@@ -2360,11 +2505,28 @@ function Set-AdcsCaSecurity {
         $sid = Get-AdcsPrincipalSidValue -Name $name
         if ($null -eq $sid) { continue }
 
+        $sidText = [string]$sid
+        if ($wanted.Contains($sidText)) {
+            $wanted[$sidText].Mask   = $wanted[$sidText].Mask -bor $script:adcsRoleAccessMask[$role]
+            $wanted[$sidText].Roles += $role
+        }
+        else {
+            $wanted[$sidText] = [pscustomobject]@{
+                Sid   = $sid
+                Name  = $name
+                Mask  = $script:adcsRoleAccessMask[$role]
+                Roles = @($role)
+            }
+        }
+    }
+
+    $applied = @()
+    foreach ($wantedAce in $wanted.Values) {
         # Replace rather than add: running this twice must not leave two ACEs for the
         # same group with different masks, which is how a permission nobody granted
         # survives a design change.
         for ($index = $descriptor.DiscretionaryAcl.Count - 1; $index -ge 0; $index--) {
-            if ([string]$descriptor.DiscretionaryAcl[$index].SecurityIdentifier -eq [string]$sid) {
+            if ([string]$descriptor.DiscretionaryAcl[$index].SecurityIdentifier -eq [string]$wantedAce.Sid) {
                 $descriptor.DiscretionaryAcl.RemoveAce($index)
             }
         }
@@ -2372,8 +2534,8 @@ function Set-AdcsCaSecurity {
             (New-Object System.Security.AccessControl.CommonAce(
                 [System.Security.AccessControl.AceFlags]::None,
                 [System.Security.AccessControl.AceQualifier]::AccessAllowed,
-                $script:adcsRoleAccessMask[$role], $sid, $false, $null)))
-        $applied += "$name ($role)"
+                $wantedAce.Mask, $wantedAce.Sid, $false, $null)))
+        $applied += ("{0} ({1})" -f $wantedAce.Name, ($wantedAce.Roles -join ", "))
     }
 
     if ($applied.Count -eq 0) {
@@ -3620,11 +3782,18 @@ function Set-AdcsTemplateDesignedSetting {
     }
 
     # The key usage extension, stated by the design rather than inherited from whatever
-    # built-in this template was duplicated from. It matters more here than it looks:
-    # NDES picks which of its three registry slots serves a request by the key usage in
-    # the CSR, and the template at the end of that slot has to agree - so the one
-    # attribute the whole slot model rests on must not be whatever CN=WebServer happens
-    # to carry in this forest. A built-in can be edited, and this one is load-bearing.
+    # built-in this template was duplicated from. It matters more here than it looks,
+    # and for a different reason in each connector mode:
+    #
+    #   SCEP  NDES picks which of its three registry slots serves a request by the key
+    #         usage in the CSR, and the template at the end of that slot has to agree -
+    #         so the one attribute the whole slot model rests on must not be whatever
+    #         CN=WebServer happens to carry in this forest.
+    #   PKCS  there is no slot and no routing, and a PKCS profile has no key usage field
+    #         at all - so the template is the ONLY thing that states it and nothing
+    #         downstream can correct a template that carries the wrong pair.
+    #
+    # A built-in can be edited, and this one is load-bearing either way.
     #
     #   0x80  digitalSignature                     console purpose "Signature"
     #   0x20  keyEncipherment                      console purpose "Encryption"
@@ -3738,6 +3907,20 @@ function Set-AdcsTemplateDesignedSetting {
     }
     else {
         $enrollFlag = $enrollFlag -band (-bnot $script:ctFlagAutoEnrollment)
+    }
+
+    # Publication into the requester's directory object. Off unless the design asks for
+    # it: every template here issues an authentication certificate, which nobody looks
+    # up in the directory, and the one that matters is the Intune connector's - the
+    # PKCS guide has "Deselect Publish certificate in Active Directory" as a numbered
+    # step. Cleared rather than left alone for the same reason as the bit above: a
+    # source template carrying it would turn it on behind the design's back.
+    if ([bool](Get-ConfigValue -InputObject $Template -Name "publishToDirectory" -Default $false)) {
+        $enrollFlag = $enrollFlag -bor $script:ctFlagPublishToDs
+        Write-Log "'$DisplayName': published to the directory" -Tag "Info"
+    }
+    else {
+        $enrollFlag = $enrollFlag -band (-bnot $script:ctFlagPublishToDs)
     }
 
     # ESC9. The bit suppresses the SID extension on everything this template issues,
@@ -4132,6 +4315,53 @@ function Publish-AdcsNdesTemplate {
     # certificate that requests certificates on behalf of other subjects.
     if ($null -eq (Get-AdcsScepSection -CertificateServices $CertificateServices)) { return }
 
+    # And only in SCEP mode. These three are the templates the NDES INSTALLER insists
+    # on - CEP Encryption and the offline enrollment agent are the registration
+    # authority pair, IPSEC (Offline request) is published only so the installer's
+    # atomic batch succeeds. The PKCS connector enrols none of them: it has no
+    # registration authority, it talks to the CA directly as its own machine account.
+    # Publishing them for a PKCS design put an enrollment-agent template into a forest
+    # with nothing to use it, and then warned twice about RA groups that mode never
+    # creates. Field-hit 2026-09-19 on a German forest.
+    if ((Get-AdcsConnectorMode -CertificateServices $CertificateServices) -ne "scep") {
+        Write-Log "The connector is in PKCS mode - NDES's registration authority templates are not needed and are left alone" -Tag "Info"
+
+        # And say so here rather than leaving it to the connector's own run: this is the
+        # CA, it is where the templates are written, and a PKCS design that names none
+        # produces a connector with nothing to enrol and a group with nothing to hold.
+        # Silence at this point is what let one run look successful and do nothing.
+        $connector = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName "scep"
+        $named = @(Get-ConfigArray -InputObject $connector -Name "templateNames" | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($named.Count -eq 0) {
+            Write-Log "The PKCS connector names NO certificate template, so this CA publishes none for it" -Tag "Warn"
+            Write-Log "    turn a template on under 'Templates this connector issues' in the studio and export again" -Tag "Warn"
+        }
+        else {
+            Write-Log "The PKCS connector asks for: $($named -join ', ')" -Tag "Info"
+
+            # Named implies built. The studio asserts this on export and corrects it on
+            # import, and it is asserted again here because a config can reach a CA
+            # without passing through either - by hand, or from a build old enough to
+            # predate the check. The symptom without this is a run that reports success
+            # on the CA and a connector run minutes later saying both of its templates
+            # are missing, with nothing joining the two.
+            $issuing = Get-ConfigValue -InputObject $CertificateServices -Name "issuing"
+            $templates = Get-ConfigValue -InputObject $issuing -Name "templates"
+            $built = @()
+            foreach ($item in @(Get-ConfigArray -InputObject $templates -Name "items")) {
+                $itemName = [string](Get-ConfigText -InputObject $item -Name "templateName" -Default "")
+                if (-not [string]::IsNullOrWhiteSpace($itemName)) { $built += $itemName }
+            }
+            foreach ($wanted in $named) {
+                $match = @($built | Where-Object { $_.Equals($wanted, [System.StringComparison]::OrdinalIgnoreCase) })
+                if ($match.Count -gt 0) { continue }
+                Write-Log "The connector asks for '$wanted' but this design does not build it - nothing here will publish it" -Tag "Warn"
+                Write-Log "    re-open the design in the studio and export it again; the template switch is under 'Templates this connector issues'" -Tag "Warn"
+            }
+        }
+        return
+    }
+
     $configurationNamingContext = Get-AdcsConfigurationNamingContext
     if ([string]::IsNullOrWhiteSpace($configurationNamingContext)) { return }
     $templatesDn = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configurationNamingContext"
@@ -4452,7 +4682,10 @@ function Set-AdcsCertificateTemplate {
             # container strip: the built-ins are off the container and this session's
             # token predates the role group that replaced them. The right is real, the
             # token is stale, and nothing else about the session says so.
-            if ($_.Exception.Message -match "Access is denied") {
+            # Matched by HRESULT as well as by the English words: a German server says
+            # "Zugriff verweigert" and the hint below is exactly the one that reader
+            # needs, since the cause is a stale token rather than a missing right.
+            if ($_.Exception.Message -match "(?i)access is denied|0x80070005|E_ACCESSDENIED|-2147024891") {
                 Write-Log "    If the built-in administrators were just stripped from the templates container, this token predates the replacement group - sign out and back in, then re-run" -Tag "Info"
             }
             $script:adcsTemplateFailure += $displayName
@@ -4514,8 +4747,10 @@ function Get-AdcsLocalCrlNextUpdate {
     $candidates = @(Get-ChildItem -Path (Join-Path -Path $script:adcsCertEnrollPath -ChildPath "*.crl") -File -ErrorAction SilentlyContinue)
     if ($candidates.Count -eq 0) { return $null }
 
+    # (see Get-AdcsCrlNextUpdateFromDump above)
     # Several generations accumulate in this folder. The one in force is the newest,
-    # so this takes the latest NextUpdate rather than the earliest.
+    # so this takes the latest NextUpdate rather than the earliest. The dump is read
+    # through Get-AdcsCrlNextUpdateFromDump, which does not depend on the label.
     $newest = $null
     foreach ($candidate in $candidates) {
         try {
@@ -4525,11 +4760,8 @@ function Get-AdcsLocalCrlNextUpdate {
             continue
         }
 
-        $match = [regex]::Match($dump, "NextUpdate:\s*(.+)")
-        if (-not $match.Success) { continue }
-
-        $parsed = [datetime]::MinValue
-        if ([datetime]::TryParse($match.Groups[1].Value.Trim(), [ref]$parsed)) {
+        $parsed = Get-AdcsCrlNextUpdateFromDump -Dump $dump
+        if ($null -ne $parsed) {
             if (($null -eq $newest) -or ($parsed -gt $newest)) { $newest = $parsed }
         }
     }
@@ -6177,7 +6409,7 @@ function Test-AdcsPrerequisite {
     if ([string]::IsNullOrWhiteSpace($tierName)) {
         $named = @()
         foreach ($candidate in @("root", "issuing", "scep", "directory")) {
-            $name = [string](Get-ConfigText -InputObject (Get-ConfigValue -InputObject $certificateServices -Name $candidate) -Name "computerName" -Default "")
+            $name = [string](Get-ConfigText -InputObject (Get-AdcsTierSection -CertificateServices $certificateServices -TierName $candidate) -Name "computerName" -Default "")
             if (-not [string]::IsNullOrWhiteSpace($name)) { $named += "'$name' ($candidate)" }
         }
         Write-Log "This machine is '$env:COMPUTERNAME' but the config describes $($named -join ', ')" -Tag "Error"
@@ -6185,7 +6417,7 @@ function Test-AdcsPrerequisite {
     }
 
     Write-Log "This server is the $tierName tier of the PKI" -Tag "Info"
-    $tier = Get-ConfigValue -InputObject $certificateServices -Name $tierName
+    $tier = Get-AdcsTierSection -CertificateServices $certificateServices -TierName $tierName
     $passed = $true
 
     # The directory tier installs nothing and signs nothing. What it needs is to be a
@@ -6211,6 +6443,8 @@ function Test-AdcsPrerequisite {
             Write-Log "NDES must not run on a domain controller - point the SCEP tier at a member server" -Tag "Error"
             return $false
         }
+        # PKCS mode installs nothing at all, so there is no feature, no payload and no
+        # role service to check for here - the tier run does its own prerequisites.
         return $true
     }
 

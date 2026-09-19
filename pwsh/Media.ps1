@@ -127,27 +127,28 @@ function Show-StudioIsoPicker {
         }
         $windowEnd = [math]::Min(($windowStart + $maxVisible - 1), ($entries.Count - 1))
 
-        if ($windowStart -gt 0) { Write-Host "    ..." -ForegroundColor DarkGray }
+        if ($windowStart -gt 0) { Write-Studio -Text "    ..." -Key "muted" }
         for ($i = $windowStart; $i -le $windowEnd; $i++) {
             $entry = $entries[$i]
-            $color = "Gray"
-            if ($entry.Kind -eq "iso") { $color = "Cyan" }
-            elseif ($entry.Kind -eq "dir" -or $entry.Kind -eq "drive") { $color = "Yellow" }
-            elseif ($entry.Kind -eq "nav") { $color = "DarkGray" }
+            # Palette keys, not ConsoleColor names - see Write-Studio in Logging.ps1.
+            $color = "fg"
+            if ($entry.Kind -eq "iso") { $color = "accent" }
+            elseif ($entry.Kind -eq "dir" -or $entry.Kind -eq "drive") { $color = "warn" }
+            elseif ($entry.Kind -eq "nav") { $color = "muted" }
 
             if ($i -eq $index) {
-                Write-Host "  > " -NoNewline -ForegroundColor Cyan
-                Write-Host $entry.Label -ForegroundColor White
+                Write-Studio -Text "  > " -Key "accent" -NoNewline
+                Write-Studio -Text $entry.Label -Key "fg"
             }
             else {
                 Write-Host "    " -NoNewline
-                Write-Host $entry.Label -ForegroundColor $color
+                Write-Studio -Text $entry.Label -Key $color
             }
         }
-        if ($windowEnd -lt ($entries.Count - 1)) { Write-Host "    ..." -ForegroundColor DarkGray }
+        if ($windowEnd -lt ($entries.Count - 1)) { Write-Studio -Text "    ..." -Key "muted" }
 
         Write-Host ""
-        if (-not $useRawUi) { Write-Host "  Enter a number, or blank to cancel." -ForegroundColor DarkGray }
+        if (-not $useRawUi) { Write-Studio -Text "  Enter a number, or blank to cancel." -Key "muted" }
 
         $chosen = $null
         if ($useRawUi) {

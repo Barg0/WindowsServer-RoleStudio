@@ -199,6 +199,7 @@ $script:scriptParts = @(
     "Role.Dns.ps1",
     "Role.Adcs.ps1",
     "Role.Adcs.Ndes.ps1",
+    "Role.Adcs.Pkcs.ps1",
     "Directory.ps1",
     "Role.Fs.ps1",
     "Role.Fs.Cluster.ps1",

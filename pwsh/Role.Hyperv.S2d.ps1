@@ -847,33 +847,33 @@ function Write-HypervS2dPlanSummary {
         [Parameter(Mandatory)][object]$Plan
     )
 
-    Write-Host "  Cluster" -ForegroundColor White
+    Write-Studio -Text "  Cluster" -Key "fg"
     $names = @(Get-HypervS2dNodeName -S2d $S2d)
-    Write-Host ("    {0}   nodes {1}" -f (Get-HypervS2dClusterName -S2d $S2d), ($names -join " + ")) -ForegroundColor Cyan
+    Write-Studio -Text ("    {0}   nodes {1}" -f (Get-HypervS2dClusterName -S2d $S2d), ($names -join " + ")) -Key "accent"
     if (-not [string]::IsNullOrWhiteSpace([string]$Plan.resiliency)) {
-        Write-Host ("    volumes        {0}" -f [string]$Plan.resiliency) -ForegroundColor Cyan
+        Write-Studio -Text ("    volumes        {0}" -f [string]$Plan.resiliency) -Key "accent"
     }
     Write-Host ""
 
-    Write-Host "  This node" -ForegroundColor White
+    Write-Studio -Text "  This node" -Key "fg"
     $disks = @()
     if (($null -ne $Plan.disks) -and ($null -ne $Plan.disks.numbers)) { $disks = @($Plan.disks.numbers) }
     if ($disks.Count -gt 0) {
-        Write-Host ("    pool disks     {0}" -f ($disks -join ", ")) -ForegroundColor Cyan
+        Write-Studio -Text ("    pool disks     {0}" -f ($disks -join ", ")) -Key "accent"
         $wipe = @()
         try { $wipe = @($Plan.disks.wipe | Where-Object { $null -ne $_ }) } catch { $wipe = @() }
         if ($wipe.Count -gt 0) {
-            Write-Host ("    erases         disk {0} - every partition and file is destroyed" -f ($wipe -join ", ")) -ForegroundColor Yellow
+            Write-Studio -Text ("    erases         disk {0} - every partition and file is destroyed" -f ($wipe -join ", ")) -Key "warn"
         }
     }
     else {
-        Write-Host "    pool disks     none ticked - the pool gets nothing from this node" -ForegroundColor DarkGray
+        Write-Studio -Text "    pool disks     none ticked - the pool gets nothing from this node" -Key "muted"
     }
     foreach ($link in @($Plan.storageLinks)) {
-        Write-Host ("    storage link   {0}   {1}/{2}" -f $link.name, $link.address, $link.prefixLength) -ForegroundColor Cyan
+        Write-Studio -Text ("    storage link   {0}   {1}/{2}" -f $link.name, $link.address, $link.prefixLength) -Key "accent"
     }
     foreach ($definition in @($Plan.switches)) {
-        Write-Host ("    " + (Get-HypervSwitchLine -Definition $definition)) -ForegroundColor Cyan
+        Write-Studio -Text ("    " + (Get-HypervSwitchLine -Definition $definition)) -Key "accent"
     }
     Write-Host ""
 }
@@ -3683,17 +3683,17 @@ function Write-HypervS2dPairingPanel {
     if ($rows.Count -eq 0) { return }
 
     Write-Host ""
-    Write-Host "  measured pairing" -ForegroundColor DarkGray
+    Write-Studio -Text "  measured pairing" -Key "muted"
     # Two lines per link, the second indented under the first, so the pair reads as one
     # thing and the adapter names line up in a column.
     foreach ($row in $rows) {
         $lead = ("  Link {0}" -f $row.Index).PadRight(11)
-        Write-Host ("{0}{1}{2}  ({3})" -f $lead, "this node ".PadRight(12), $row.Local, $row.LocalMac) -ForegroundColor White
+        Write-Studio -Text ("{0}{1}{2}  ({3})" -f $lead, "this node ".PadRight(12), $row.Local, $row.LocalMac) -Key "fg"
         if ([string]::IsNullOrWhiteSpace($row.Peer)) {
-            Write-Host ("{0}{1}nothing answered on this wire" -f "".PadRight(11), "other node".PadRight(12)) -ForegroundColor Red
+            Write-Studio -Text ("{0}{1}nothing answered on this wire" -f "".PadRight(11), "other node".PadRight(12)) -Key "danger"
         }
         else {
-            Write-Host ("{0}{1}{2}  ({3})" -f "".PadRight(11), "other node".PadRight(12), $row.Peer, $row.PeerMac) -ForegroundColor Green
+            Write-Studio -Text ("{0}{1}{2}  ({3})" -f "".PadRight(11), "other node".PadRight(12), $row.Peer, $row.PeerMac) -Key "success"
         }
     }
     Write-Host ""

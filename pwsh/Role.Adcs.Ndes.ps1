@@ -288,7 +288,7 @@ $script:adcsScepIisAppId = "{4dc3e181-e14b-4a21-b022-59fc669b0914}"
 function Get-AdcsScepSection {
     param([object]$CertificateServices)
 
-    $scep = Get-ConfigValue -InputObject $CertificateServices -Name "scep"
+    $scep = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName "scep"
     if ($null -eq $scep) { return $null }
     if (-not [bool](Get-ConfigValue -InputObject $scep -Name "enabled" -Default $false)) { return $null }
     return $scep
@@ -498,7 +498,7 @@ function Get-AdcsScepSlotTemplate {
 
     $fallback = Get-AdcsScepTemplateName -CertificateServices $CertificateServices
 
-    $scep = Get-ConfigValue -InputObject $CertificateServices -Name "scep"
+    $scep = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName "scep"
     $templates = Get-ConfigValue -InputObject $scep -Name "templates"
     if ($null -eq $templates) {
         # Written before the slots existed. One template, three slots, exactly as before.
@@ -742,6 +742,11 @@ function Set-AdcsScepDirectory {
     $scep = Get-AdcsScepSection -CertificateServices $CertificateServices
     if ($null -eq $scep) { return $true }
 
+    # One group, one computer account, and no service account at all - see the PKCS file.
+    if ((Get-AdcsConnectorMode -CertificateServices $CertificateServices) -eq "pkcs") {
+        return (Set-AdcsPkcsDirectory -CertificateServices $CertificateServices -Connector $scep)
+    }
+
     $account = Get-AdcsScepServiceAccount -Scep $scep
     if ($null -eq $account) {
         Write-Log "The SCEP tier is on but carries no service account - NDES cannot run without one" -Tag "Error"
@@ -977,6 +982,20 @@ function Write-AdcsScepPayloadDiagnosis {
 # Never fatal: a server where this cannot be written is a server where the connector
 # setup will say so itself, and failing the whole tier over a browser setting would
 # be the wrong shape of refusal.
+# BOTH components, and there is no switch. Microsoft lists "The Enhanced Security
+# Configuration must be deactivated" as a connector prerequisite, and a prerequisite is
+# something this project does rather than something it offers - the same rule that has
+# the run install NDES's dozen features instead of printing them.
+#
+# An -AdministratorsOnly variant was written and withdrawn on 2026-09-19. The reasoning
+# for it was sound as far as it went: what Enhanced Security Configuration blocks for
+# this role is the connector wizard's interactive Entra sign-in, performed by an
+# administrator at the console, and the connector SERVICE reaches Intune over
+# HttpClient rather than through WinINET zones. But the wizard has a Prerequisites page
+# that runs its own checks, nothing here can prove which of the two Active Setup
+# components it reads, and a "narrowing" that makes the vendor's own check fail is not
+# a narrowing - it is a second bug wearing the first one's clothes. Doing the documented
+# prerequisite in full is the answer until somebody reads that check on a bench.
 function Disable-AdcsScepEnhancedSecurity {
     foreach ($component in $script:adcsScepEscComponent) {
         $path = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\$($component.Guid)"
@@ -3027,7 +3046,14 @@ function Invoke-AdcsScepTier {
 
     $scep = Get-AdcsScepSection -CertificateServices $CertificateServices
     if ($null -eq $scep) {
-        return (New-RoleResult -Status "Completed" -Message "The SCEP tier is switched off in the design - nothing to do on this server.")
+        return (New-RoleResult -Status "Completed" -Message "The connector tier is switched off in the design - nothing to do on this server.")
+    }
+
+    # PKCS is its own mode and shares nothing below this line - no NDES, no IIS, no
+    # registration authority, no service account. Its own file, the same way the S2D
+    # cluster mode has one, and nothing in the NDES path is altered by its existence.
+    if ((Get-AdcsConnectorMode -CertificateServices $CertificateServices) -eq "pkcs") {
+        return (Invoke-AdcsPkcsTier -CertificateServices $CertificateServices -Connector $scep)
     }
 
     if (Test-AdcsDomainController) {

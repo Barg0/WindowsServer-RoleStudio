@@ -70,7 +70,7 @@ card lays out:
 | **Active Directory Domain Services** | A new forest or another controller, sites, UPN suffixes, and the settings that only apply after the promotion reboot |
 | **DNS Server** | Forwarders, zones, reverse zones, scavenging |
 | **Certificate Services** | A two-tier PKI — offline root, issuing CA, templates, role groups, publication, hardening |
-| **Intune Certificate Connector** | The SCEP/NDES side of it, either alongside the PKI or bolted onto one you already have |
+| **Intune Certificate Connector** | Two modes — **PKCS** (the default: the connector asks the CA directly, no NDES, no IIS, no template ceiling) or **SCEP** on an NDES server. Either alongside the PKI or bolted onto one you already have |
 | **File Server** | Shares with tight ACLs — one access group each, or a read/write and a read-only one — DFS namespaces, shadow copies and the drive-map policies |
 | **Print Server** | Drivers, TCP/IP ports, queues, and the policies that push them out to people |
 | **DHCP Server** | Scopes, options, DNS registration — or joining an existing server as its failover partner |
