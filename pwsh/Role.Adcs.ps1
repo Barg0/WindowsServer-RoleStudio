@@ -2496,16 +2496,37 @@ function Set-AdcsTemplateContainerAcl {
     foreach ($containerDn in $containers) {
         try {
             $entry = Get-AdcsDirectoryEntry -DistinguishedName $containerDn
-            # GenericAll, not the individual rights it decomposes into. The certificate
-            # templates console shows five checkboxes - Full Control, Read, Write, Enroll,
-            # Autoenroll - and a set like CreateChild/WriteProperty maps to none of them, so
-            # the group appears on the tab with nothing ticked and reads as having no access
-            # at all. It is only visible under Advanced, which is not where anybody looks.
-            $rights = [System.DirectoryServices.ActiveDirectoryRights]::GenericAll
+            # Every right GenericAll decomposes into EXCEPT ExtendedRight, which is the
+            # exact set Microsoft grants Domain Admins on its own templates: the SDDL on
+            # CN=KerberosAuthentication reads CCDCLCSWRPWPDTLOSDRCWDWO and this is that
+            # string. The omission is the whole point. On a template object the only two
+            # extended rights that exist are Enroll and Autoenroll, so GenericAll here -
+            # inherited by every template in the forest - quietly made the template
+            # managers an autoenrolling principal on all of them. A member of the group
+            # signing in to any machine then had its autoenrollment client submit for
+            # every template flagged CT_FLAG_AUTO_ENROLLMENT, including the domain
+            # controller one, and the CA denied each in turn: pages of Denied by Policy
+            # Module against a design that grants them nothing. Bench-found on 2026-09-19.
+            #
+            # Still not the individual rights spelled out one by one for presentation's
+            # sake. The certificate templates console has five checkboxes - Full Control,
+            # Read, Write, Enroll, Autoenroll - and this set ticks Read and Write, which
+            # is what the group does. A set like CreateChild/WriteProperty alone maps to
+            # none of them and would leave the group looking as though it held nothing.
+            $rights = [System.DirectoryServices.ActiveDirectoryRights]"CreateChild, DeleteChild, ListChildren, Self, ReadProperty, WriteProperty, DeleteTree, ListObject, Delete, ReadControl, WriteDacl, WriteOwner"
             $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
                 $sid, $rights, [System.Security.AccessControl.AccessControlType]::Allow,
                 [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All)
-            $entry.ObjectSecurity.AddAccessRule($rule)
+            # Purge before granting, and not as tidiness: AddAccessRule MERGES, so on a
+            # container that already carries this group's old GenericAll the new narrower
+            # rule is added beside it and the extended rights survive untouched. A run
+            # against an existing deployment would then report the fix and change nothing.
+            # Only this group's explicit rules go; anything inherited from further up
+            # belongs to a decision made above this container and cannot be removed here.
+            $security = $entry.ObjectSecurity
+            $security.PurgeAccessRules($sid)
+            $security.AddAccessRule($rule)
+            $entry.ObjectSecurity = $security
             $entry.CommitChanges()
         }
         catch {
@@ -2513,11 +2534,12 @@ function Set-AdcsTemplateContainerAcl {
             $allDone = $false
             continue
         }
-        Write-Log "Granted '$name' full control on $containerDn, inherited by the objects in it" -Tag "Ok"
+        Write-Log "Granted '$name' read and write on $containerDn, inherited by the objects in it" -Tag "Ok"
     }
 
     Write-Log "    Enterprise Admins keep their own access - this says who edits templates routinely, not who is prevented" -Tag "Debug"
-    Write-Log "    Full control here is inherited by every template, which is write access to what a certificate may assert" -Tag "Debug"
+    Write-Log "    Read and write here is inherited by every template, which is write access to what a certificate may assert" -Tag "Debug"
+    Write-Log "    Enroll and autoenroll are deliberately not in it - managing a template is not enrolling for one" -Tag "Debug"
     return $allDone
 }
 
@@ -2778,6 +2800,13 @@ $script:adcsWellKnownPrincipal = @{
     "domainControllers"           = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::AccountControllersSid;      DomainRelative = $true;  Label = "Domain Controllers" }
     "enterpriseDomainControllers" = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::EnterpriseControllersSid;   DomainRelative = $false; Label = "Enterprise Domain Controllers" }
     "rasAndIasServers"            = [pscustomobject]@{ Type = [System.Security.Principal.WellKnownSidType]::AccountRasAndIasServersSid; DomainRelative = $true;  Label = "RAS and IAS Servers" }
+    # .NET has no WellKnownSidType for this one, so it is the only entry built from a RID
+    # rather than from the enumeration - and the RID sits on the FOREST ROOT domain's SID,
+    # the same shape as Enterprise Admins, because that is where the group lives. In a
+    # single-domain forest the two naming contexts are the same string and ForestRoot
+    # costs nothing; in a child domain, reading the account domain would build the SID of
+    # a group that does not exist and grant enrollment to nobody.
+    "enterpriseReadOnlyDomainControllers" = [pscustomobject]@{ Type = $null; DomainRelative = $true; ForestRoot = $true; Rid = 498; Label = "Enterprise Read-only Domain Controllers" }
 }
 
 # One of them as a SID, or $null with a line saying which and why. A code this build does
@@ -2801,10 +2830,21 @@ function Get-AdcsWellKnownPrincipalSid {
         # checked for empty, because Get-AdcsDomainSid takes it as a mandatory parameter
         # and an empty string fails the binding rather than the lookup.
         $namingContext = ""
-        try { $namingContext = [string](Get-AdcsDefaultNamingContext) }
-        catch { $namingContext = "" }
+        if ($definition.ForestRoot) {
+            try {
+                $rootDse = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
+                $namingContext = [string]$rootDse.Properties["rootDomainNamingContext"].Value
+            }
+            catch { $namingContext = "" }
+        }
+        else {
+            try { $namingContext = [string](Get-AdcsDefaultNamingContext) }
+            catch { $namingContext = "" }
+        }
         if ([string]::IsNullOrWhiteSpace($namingContext)) {
-            Write-Log "No domain answered, so '$($definition.Label)' could not be resolved - it is a group in the account domain" -Tag "Warn"
+            $where = "the account domain"
+            if ($definition.ForestRoot) { $where = "the forest root domain" }
+            Write-Log "No domain answered, so '$($definition.Label)' could not be resolved - it is a group in $where" -Tag "Warn"
             return $null
         }
         $domainSid = Get-AdcsDomainSid -NamingContext $namingContext
@@ -2815,6 +2855,11 @@ function Get-AdcsWellKnownPrincipalSid {
     }
 
     try {
+        # A RID is arithmetic on the domain SID this function just read, for the groups
+        # the enumeration does not name. Everything else goes through WellKnownSidType.
+        if ($null -ne $definition.Rid) {
+            return (New-Object System.Security.Principal.SecurityIdentifier("$($domainSid.Value)-$($definition.Rid)"))
+        }
         return (New-Object System.Security.Principal.SecurityIdentifier($definition.Type, $domainSid))
     }
     catch {
@@ -3191,6 +3236,80 @@ function Grant-AdcsTemplateEnrollment {
 # themselves back in, and no setting below the forest owner changes that. So this
 # records who edits templates *routinely* and keeps an accidental edit from being
 # anybody's, which is worth something - it is not a boundary against those two groups.
+# NT AUTHORITY\SYSTEM on a template this run created, which is the schema's doing and not
+# this design's. An object created without an explicit security descriptor gets the
+# defaultSecurityDescriptor of its class, and pKICertificateTemplate's hands SYSTEM and
+# the two admin groups RPWPCRCCDCLCLORCWOWDSDDTSW - everything, CR included. CR on a
+# template object is Enroll and Autoenroll, so every template this tool has ever built
+# came out with SYSTEM holding both and the console showing all five boxes ticked for it.
+# Microsoft's own templates carry none of this: theirs were written with an explicit
+# descriptor at domain prep, which is why the built-in Domain Controller Authentication
+# has no SYSTEM entry at all and issues perfectly well without one.
+#
+# Removed, and not only for parity. Nothing needs it - the CA reaches the directory as
+# its own computer account, never as SYSTEM, and the resume task presents as HOST$ for
+# the same reason. What the ACE does buy is a way around the delegation this role just
+# built: WriteDacl and WriteOwner mean anything running as LocalSystem on a domain
+# controller can rewrite any of these templates, which is the ESC4 shape the template
+# managers group was narrowed to avoid.
+#
+# Unconditional, unlike the built-in admin strip below it. That one is a hardening choice
+# about who administers this PKI. This is an ACE the design never asked for and the
+# product does not put there, so there is nothing to weigh up.
+function Remove-AdcsTemplateSystemAce {
+    param([Parameter(Mandatory)][object]$TemplateEntry)
+
+    $systemSid = $null
+    try {
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier(
+            [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    }
+    catch {
+        Write-Log "Could not build the SYSTEM SID - its access to this template was left alone: $($_.Exception.Message)" -Tag "Warn"
+        return
+    }
+
+    try {
+        # A freshly created template is holding a descriptor read before the object
+        # existed, so ask the directory for the current one first.
+        $TemplateEntry.RefreshCache(@("nTSecurityDescriptor"))
+        $security = $TemplateEntry.ObjectSecurity
+
+        $explicit = @($security.Access | Where-Object {
+            (-not $_.IsInherited) -and ([string](Get-AdcsAccessRuleSid -Rule $_) -eq [string]$systemSid.Value)
+        })
+        if ($explicit.Count -eq 0) { return }
+
+        # PurgeAccessRules for the same reason the built-in strip uses it: the specific
+        # form matches on the whole rule and removes nothing at all when it does not.
+        $security.PurgeAccessRules($systemSid)
+        $TemplateEntry.ObjectSecurity = $security
+        $TemplateEntry.CommitChanges()
+    }
+    catch {
+        Write-Log "Could not remove SYSTEM from the template: $($_.Exception.Message)" -Tag "Warn"
+        return
+    }
+
+    # Read it back rather than report what was asked for - an ACL step that says
+    # 'removed' for a run in which nothing came off is the worst way to be wrong.
+    try {
+        $TemplateEntry.RefreshCache(@("nTSecurityDescriptor"))
+        $left = @($TemplateEntry.ObjectSecurity.Access | Where-Object {
+            [string](Get-AdcsAccessRuleSid -Rule $_) -eq [string]$systemSid.Value
+        })
+        if ($left.Count -eq 0) {
+            Write-Log "    SYSTEM removed from the template - the schema default had handed it enroll and autoenroll" -Tag "Debug"
+        }
+        else {
+            Write-Log "    SYSTEM still holds access on this template" -Tag "Warn"
+        }
+    }
+    catch {
+        # Reporting must never be what fails an ACL step that already succeeded.
+    }
+}
+
 function Remove-AdcsTemplateBuiltinAdmin {
     param(
         [Parameter(Mandatory)][object]$TemplateEntry,
@@ -3203,8 +3322,10 @@ function Remove-AdcsTemplateBuiltinAdmin {
     if (-not [bool](Get-ConfigValue -InputObject $roleGroups -Name "applyCaSecurity" -Default $false)) { return }
 
     # Only the two domain groups. The local Administrators group is not on a template's
-    # access control list, and SYSTEM and Authenticated Users are what make the
-    # template usable at all.
+    # access control list, and Authenticated Users is the read that enrollment itself
+    # needs - Microsoft's own templates carry it and nothing else in common with these.
+    # SYSTEM used to be excluded here on the same reasoning and that reasoning was wrong:
+    # it is not needed for anything, and Remove-AdcsTemplateSystemAce now takes it off.
     $builtin = @(Get-AdcsBuiltinAdminSid | Where-Object { $_ -ne $script:adcsBuiltinAdministratorsSid })
     if ($builtin.Count -eq 0) { return }
 
@@ -3736,6 +3857,7 @@ function Copy-AdcsCertificateTemplate {
             # the group and run this again" would never be true.
             Write-Log "Template '$templateName' exists - settings left alone, enrollment rights reconciled" -Tag "Info"
             Set-AdcsTemplateEnrollmentAcl -TemplateEntry $existing -Template $Template
+            Remove-AdcsTemplateSystemAce -TemplateEntry $existing
             Remove-AdcsTemplateBuiltinAdmin -TemplateEntry $existing -CertificateServices $CertificateServices
             return $templateName
         }
@@ -3783,6 +3905,7 @@ function Copy-AdcsCertificateTemplate {
         Write-Log "Template '$displayName' overridden - revision $($currentRevision + 1)" -Tag "Ok"
 
         Set-AdcsTemplateEnrollmentAcl -TemplateEntry $existing -Template $Template
+        Remove-AdcsTemplateSystemAce -TemplateEntry $existing
         Remove-AdcsTemplateBuiltinAdmin -TemplateEntry $existing -CertificateServices $CertificateServices
         return $templateName
     }
@@ -3819,6 +3942,7 @@ function Copy-AdcsCertificateTemplate {
     Write-Log "Template '$displayName' created" -Tag "Ok"
 
     Set-AdcsTemplateEnrollmentAcl -TemplateEntry $new -Template $Template
+    Remove-AdcsTemplateSystemAce -TemplateEntry $new
     Remove-AdcsTemplateBuiltinAdmin -TemplateEntry $new -CertificateServices $CertificateServices
 
     return $templateName

@@ -2225,7 +2225,12 @@ const TEMPLATE_CATALOG = [
        so the access panel renders these as facts. */
     fixedPrincipals: [
       { wellKnown: "domainControllers", mode: "autoenroll" },
-      { wellKnown: "enterpriseDomainControllers", mode: "autoenroll" }
+      { wellKnown: "enterpriseDomainControllers", mode: "autoenroll" },
+      /* The built-in Kerberos Authentication template grants this one too, and it is
+         the principal a read-only domain controller actually authenticates as - an
+         RODC is not a member of Domain Controllers. Without it the template looks
+         complete and the first RODC promoted into the forest silently never enrolls. */
+      { wellKnown: "enterpriseReadOnlyDomainControllers", mode: "autoenroll" }
     ],
     /* The copied EKUs include Client Authentication and Smart Card Logon - this
        certificate authenticates as the domain controller, which is why its
@@ -3003,12 +3008,15 @@ const BROAD_PRINCIPALS = [
    simply never written - a Domain Controller Authentication template published, flagged
    for autoenrollment, and holding no autoenroll right at all. That is a real bench
    failure, on a German domain, and it is why nothing here is a name.
-   `rid` is the domain's own SID plus that number; `sid` is absolute and belongs to no
-   domain. Mirrored by $script:adcsWellKnownPrincipal in Role.Adcs.ps1. */
+   `rid` is the domain's own SID plus that number; `forestRid` is the FOREST ROOT
+   domain's SID plus that number, which is where the enterprise-wide groups live; `sid`
+   is absolute and belongs to no domain. Mirrored by $script:adcsWellKnownPrincipal in
+   Role.Adcs.ps1. */
 const WELL_KNOWN_MEMBERS = {
   domainControllers: { label: "Domain Controllers", rid: 516 },
   domainComputers: { label: "Domain Computers", rid: 515 },
   enterpriseDomainControllers: { label: "Enterprise Domain Controllers", sid: "S-1-5-9" },
+  enterpriseReadOnlyDomainControllers: { label: "Enterprise Read-only Domain Controllers", forestRid: 498 },
   rasAndIasServers: { label: "RAS and IAS Servers", rid: 553 }
 };
 
