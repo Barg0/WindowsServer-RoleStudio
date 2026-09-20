@@ -626,7 +626,14 @@ function Show-PkcsSummary {
 
     $groupName = Get-AdcsPkcsGroupName -Connector $Connector
     if (-not [string]::IsNullOrWhiteSpace($groupName)) {
-        Write-FastfetchInfoRow -Label "enrolls through" -Value $groupName -LabelWidth 24 -IndentWidth 2
+        Write-FastfetchInfoRow -Label "connector group" -Value $groupName -LabelWidth 24 -IndentWidth 2
+    }
+    # Where that group is nested, because the enrollment right is one level down from
+    # the group the reader was just shown and a screen that stopped at the group above
+    # would describe an ACL nobody would find.
+    $templateGroups = @(Get-AdcsPkcsTemplateGroup -Connector $Connector)
+    if ($templateGroups.Count -gt 0) {
+        Write-FastfetchInfoRow -Label "nested into" -Value ($templateGroups -join ", ") -LabelWidth 24 -IndentWidth 2
     }
     # SYSTEM is the design's answer and the installer's default, so the identity that
     # reaches the CA is this machine. Stated because it is the one thing people get

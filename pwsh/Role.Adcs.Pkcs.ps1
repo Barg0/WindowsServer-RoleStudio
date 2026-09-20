@@ -78,6 +78,20 @@ function Get-AdcsPkcsGroupName {
     return ([string](Get-ConfigText -InputObject $Connector -Name "enrollmentGroup" -Default "")).Trim()
 }
 
+# The enrollment group each selected template grants Enroll to - what the connector
+# group is nested into. The studio reads them off the same template grants the issuing
+# run writes the ACEs from, so this list and those ACEs name the same strings.
+function Get-AdcsPkcsTemplateGroup {
+    param([Parameter(Mandatory)][object]$Connector)
+
+    $names = @()
+    foreach ($name in @(Get-ConfigArray -InputObject $Connector -Name "templateGroups")) {
+        $text = ([string]$name).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($text) -and ($names -notcontains $text)) { $names += $text }
+    }
+    return $names
+}
+
 function Get-AdcsPkcsTemplateName {
     param([Parameter(Mandatory)][object]$Connector)
 
@@ -89,11 +103,79 @@ function Get-AdcsPkcsTemplateName {
     return $names
 }
 
+# The connector group goes INSIDE each template's own enrollment group rather than onto
+# the template itself, so a PKCS template's ACL has the same shape as every other
+# template this design writes and withdrawing one is a change to one group. What
+# Microsoft's shared-queue rule actually needs survives that: every connector is still in
+# one group, and that group is in all of them, so a second connector reaches every PKCS
+# template the moment it joins - which is the property a per-connector group would break
+# and a per-template group never did.
+#
+# Every run, and not only the run that creates the group. Set-AdcsAccessGroup adopts a
+# group that already exists and leaves its membership alone, which is right for a
+# membership somebody decided and exactly wrong for this one: the nesting is structural,
+# not a decision, and a design whose second run silently skipped it would issue nothing
+# and point at the template.
+#
+# Add-only, like every other membership write in this project. A group that is missing is
+# an Error rather than a Warn: the template is published, its Enroll rule names a group,
+# and nothing is inside it - a CA that refuses the connector and says nothing about why.
+function Add-AdcsPkcsGroupNesting {
+    param(
+        [Parameter(Mandatory)][string]$ConnectorGroup,
+        [string[]]$TemplateGroup = @()
+    )
+
+    $names = @($TemplateGroup | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($names.Count -eq 0) {
+        Write-Log "No template enrollment group is named, so '$ConnectorGroup' is nested into nothing here" -Tag "Info"
+        Write-Log "    Expected in the original retrofit, where the templates and their groups belong to whoever owns that CA" -Tag "Debug"
+        return $true
+    }
+
+    $connectorEntry = Find-AdcsGroup -Name $ConnectorGroup
+    if ($null -eq $connectorEntry) {
+        Write-Log "The group '$ConnectorGroup' could not be read back - it was not nested into anything" -Tag "Error"
+        return $false
+    }
+    $connectorDn = [string]$connectorEntry.Properties["distinguishedname"][0]
+
+    $allDone = $true
+    foreach ($name in $names) {
+        $entry = Find-AdcsGroup -Name $name
+        if ($null -eq $entry) {
+            Write-Log "The enrollment group '$name' does not exist - '$ConnectorGroup' is not in it, so nothing can enroll that template" -Tag "Error"
+            Write-Log "    The access-group pass on this run creates it; with group creation switched off it is yours to make, then re-run" -Tag "Info"
+            $allDone = $false
+            continue
+        }
+
+        $group = $entry.GetDirectoryEntry()
+        $members = @()
+        try { $members = @($group.Properties["member"] | ForEach-Object { [string]$_ }) } catch { $members = @() }
+        if ($members -contains $connectorDn) {
+            Write-Log "'$ConnectorGroup' is already in '$name'" -Tag "Debug"
+            continue
+        }
+
+        try {
+            $null = $group.Properties["member"].Add($connectorDn)
+            $group.CommitChanges()
+        }
+        catch {
+            Write-Log "Could not nest '$ConnectorGroup' into '$name': $($_.Exception.Message)" -Tag "Error"
+            $allDone = $false
+            continue
+        }
+        Write-Log "Nested '$ConnectorGroup' into '$name'" -Tag "Ok"
+    }
+    return $allDone
+}
+
 # ---------------------------[ The directory tier's half ]---------------------------
-# One group, and the computer account in it. There is no service account to create and
-# no second group: every PKCS-capable connector in a tenant picks requests off one
-# shared queue, so Microsoft requires them all to hold the same permissions - a group
-# per template would model a distinction that cannot exist.
+# One group holding the computer accounts, nested into each template's own enrollment
+# group. There is no service account to create: the connector runs as SYSTEM and reaches
+# the CA as the machine.
 function Set-AdcsPkcsDirectory {
     param(
         [Parameter(Mandatory)][object]$CertificateServices,
@@ -125,14 +207,21 @@ function Set-AdcsPkcsDirectory {
         return $false
     }
 
+    # After the member, not before: a group nested somewhere before it holds anything is
+    # a right granted to nobody, and the order costs nothing to get right.
+    if (-not (Add-AdcsPkcsGroupNesting -ConnectorGroup $groupName `
+                -TemplateGroup (Get-AdcsPkcsTemplateGroup -Connector $Connector))) {
+        return $false
+    }
+
     # Said here because this run cannot do it and the next one can: the group exists
     # now and holds nothing on any CA until the issuing run writes its ACEs.
     $caName = Get-AdcsPkcsCaCommonName -CertificateServices $CertificateServices
     if ([string]::IsNullOrWhiteSpace($caName)) {
-        Write-Log "'$groupName' is created and filled - no issuing CA is named, so its permissions are somebody else's to grant" -Tag "Warn"
+        Write-Log "'$groupName' is created, filled and nested - no issuing CA is named, so its permissions are somebody else's to grant" -Tag "Warn"
     }
     else {
-        Write-Log "'$groupName' is created and filled - the run on '$caName' grants it Request Certificates and Enroll on the templates" -Tag "Info"
+        Write-Log "'$groupName' is created, filled and nested - the run on '$caName' grants it Request Certificates and writes each template's Enroll rule" -Tag "Info"
     }
     return $true
 }

@@ -2212,14 +2212,21 @@ const BUILTIN_TEMPLATE_NAMES = [
   "SubCA", "User", "UserSignature", "WebServer", "Workstation"
 ];
 
-/* The one group every PKCS template is enrolled through, and the one the CA names.
-   It is a single group rather than one per template on purpose: Microsoft's rule is
-   that any PKCS-capable connector can pick up any request off the shared Intune
-   queue, so every connector in a tenant has to hold the SAME permissions - a
-   per-template group would be modelling a distinction that cannot exist. Plural
-   because the membership grows: the second connector somebody installs is one
-   group-add away from working. The "AD CS - " prefix rather than "Certificate - "
-   because this group holds rights on the CA itself as well as on the templates. */
+/* The group the connectors themselves are in, and the one the CA names. One group
+   rather than one per connector because Microsoft's rule is that any PKCS-capable
+   connector can pick up any request off the shared Intune queue, so every connector
+   in a tenant has to hold the SAME permissions. Plural because the membership grows:
+   the second connector somebody installs is one group-add away from working. The
+   "AD CS - " prefix rather than "Certificate - " because this group holds rights on
+   the CA itself as well as reaching the templates.
+
+   It is NOT what a PKCS template grants Enroll to. Each PKCS template has its own
+   `Certificate - <display name>` group like every other template in this studio, and
+   this group is NESTED inside each of them. That keeps the property Microsoft's rule
+   actually needs - one membership, and a connector in it reaches every PKCS template
+   at once - while leaving the template ACLs the shape the rest of the design uses, so
+   withdrawing one template is a change to one group instead of to a shared one, and
+   the CA rights this group holds stop riding on an ACE that says "enrollment". */
 const PKCS_CONNECTOR_GROUP = "AD CS - Intune Certificate Connectors";
 
 const TEMPLATE_CATALOG = [
@@ -2605,13 +2612,14 @@ const TEMPLATE_CATALOG = [
        installer's default and this design's choice - reaches the CA as the connector
        host's computer account, which is what Microsoft's own "Denied by Policy Module"
        fix grants Read and Enroll to. */
+    /* Derived from the display name like every other template's, and the connector
+       group goes INSIDE it rather than onto the template - see PKCS_CONNECTOR_GROUP.
+       Nothing is seeded here: the machine is a member of the connector group, which
+       the PKCS directory step owns, and this group holds that group. */
     suggestedGroup: {
       mode: "enroll",
-      description: "The Intune Certificate Connector's computer account - the only principal that enrolls PKCS requests"
+      description: "Enrollment for this PKCS template - holds the Intune Certificate Connectors group, nested"
     },
-    /* Fixed, not derived from the display name: both PKCS templates share one group.
-       See PKCS_CONNECTOR_GROUP. */
-    fixedGroup: PKCS_CONNECTOR_GROUP,
     supersedeTemplates: [],
     unpublishSuperseded: false,
     enrolleeSuppliesSubject: true,
@@ -2656,13 +2664,14 @@ const TEMPLATE_CATALOG = [
     purpose: "Signs a user in to a remote desktop with Windows Hello - the PIN or the fingerprint on their own machine unlocks a certificate the far end accepts as a smart card.",
     note: "Microsoft's own Windows Hello RDP guidance covers both connector features and states exactly one difference for this one: <em>if you deploy certificates with a PKCS profile, select the option Allow private key to be exported</em>. Everything else is the SCEP twin - the key must be created by the <strong>Microsoft Passport Key Storage Provider</strong> or the certificate does not land in the Windows Hello container, and this design writes <code>pKIDefaultCSPs</code> directly instead of the <code>certutil -dstemplate</code> round trip the guide describes. What selects the container on the device is the profile's <strong>Key storage provider</strong> field, not this attribute: here the requester is the connector on a member server, so the provider named here is a statement about the template rather than a constraint the CA enforces. The name a profile asks for is <code>PKCSWindowsHello</code>.",
     fixedPrincipals: [],
+    /* Derived from the display name like every other template's, and the connector
+       group goes INSIDE it rather than onto the template - see PKCS_CONNECTOR_GROUP.
+       Nothing is seeded here: the machine is a member of the connector group, which
+       the PKCS directory step owns, and this group holds that group. */
     suggestedGroup: {
       mode: "enroll",
-      description: "The Intune Certificate Connector's computer account - the only principal that enrolls PKCS requests"
+      description: "Enrollment for this PKCS template - holds the Intune Certificate Connectors group, nested"
     },
-    /* Fixed, not derived from the display name: both PKCS templates share one group.
-       See PKCS_CONNECTOR_GROUP. */
-    fixedGroup: PKCS_CONNECTOR_GROUP,
     supersedeTemplates: [],
     unpublishSuperseded: false,
     enrolleeSuppliesSubject: true,
@@ -2809,6 +2818,34 @@ function pkcsTemplateName(id) {
   const item = state.adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
   if (!item) { return ""; }
   return String(item.templateName || "").trim();
+}
+
+/* The groups that hold Enroll on the selected PKCS templates, which is what the
+   connector group is nested INTO. Read off the grants the template section actually
+   writes rather than derived a second time here: the group this run puts the connector
+   into and the group the issuing run writes the template's ACE for have to be the same
+   string, and one derivation cannot drift from itself.
+
+   The connector group is skipped where it appears - a config written before the nesting
+   existed names it on the template directly, and a group cannot be nested into itself.
+   Broad principals are skipped too: nesting into Domain Users would hand every PKCS
+   template to the domain, which is the exact shape this template's exception rests on
+   not being true. */
+function pkcsTemplateEnrollmentGroups() {
+  const seen = {};
+  const groups = [];
+  pkcsSelectedTemplateIds().forEach(function (id) {
+    const item = state.adcs.issuing.templates.items.filter(function (entry) { return entry.id === id; })[0];
+    if (!item) { return; }
+    templatePrincipals(item).enroll.forEach(function (name) {
+      const clean = String(name || "").trim();
+      if (!clean || isBroadPrincipal(clean) || seen[clean.toLowerCase()]) { return; }
+      if (clean.toLowerCase() === PKCS_CONNECTOR_GROUP.toLowerCase()) { return; }
+      seen[clean.toLowerCase()] = true;
+      groups.push(clean);
+    });
+  });
+  return groups;
 }
 
 function pkcsToggleTemplate(id) {
@@ -6646,7 +6683,7 @@ function defaultAdcsAccess() {
     if (!entry.suggestedGroup) { return; }
     grants[entry.id] = [{
       _id: uid("grant"),
-      principal: entry.fixedGroup || (DEFAULT_GROUP_PREFIX + entry.displayName),
+      principal: DEFAULT_GROUP_PREFIX + entry.displayName,
       mode: entry.suggestedGroup.mode,
       auto: true
     }];
@@ -6672,9 +6709,6 @@ function accessGrants(templateId) {
 function derivedGroupNameFor(item) {
   const catalog = templateCatalogEntry(item.id) || {};
   if (!catalog.suggestedGroup) { return ""; }
-  /* A template that names its own group takes it whatever the prefix says - the
-     PKCS pair share one, and a name that moved with the prefix would split them. */
-  if (catalog.fixedGroup) { return catalog.fixedGroup; }
   return state.adcs.access.prefix + String(item.displayName || "").trim();
 }
 /* A grant left on auto follows the prefix and the template name, so changing either
@@ -7686,6 +7720,21 @@ function validatePkcsSection(error, warn) {
   if (selected.indexOf("whfbRdpSignInPkcs") !== -1 && !String(adcs.shared.forestDomainName || "").trim()) {
     warn("Certificate Services", "The Windows Hello template is selected but the design names no forest domain, so nothing here can " +
       "check the certificate a Microsoft Entra joined client needs from a domain controller to trust it.");
+  }
+
+  /* The groups are the whole control in this mode, so a design that names one and then
+     never makes it is the failure worth blocking on. Checked separately from the role
+     group below because they are made by two different passes: the enrollment groups by
+     the access pass, the connector group by the role-group pass. Not asked of a retrofit
+     at all - `prepare` sets the contract's flag itself, and the original retrofit builds
+     no template to need a group. */
+  if (!scepStandalone() && !adcs.access.createGroups) {
+    /* No &hellip; in here: toPlainIssueText strips tags and decodes four entities, so a
+       fifth would reach the review blade as its own source. */
+    error("Certificate Services", "Each PKCS template is enrolled through a group of its own - <strong>" + esc(adcs.access.prefix) +
+      "&lt;template&gt;</strong>, with <strong>" + esc(PKCS_CONNECTOR_GROUP) + "</strong> nested inside it - and enrollment group " +
+      "creation is switched off. Those groups are never made, every template's Enroll rule names a principal that does not exist, and " +
+      "the connector is refused by a CA that will not say why.", "adcs.access.createGroups");
   }
 
   /* The group is the whole control in this mode, so a design that creates it and then
@@ -12662,10 +12711,16 @@ function buildAdcsPkcsSection() {
        carries - the shape says which mode wrote it. A name here is the same string
        the Intune profile's "Certificate template name" field takes. */
     templateNames: pkcsSelectedTemplateIds().map(pkcsTemplateName).filter(function (name) { return !!name; }),
-    /* One group for both templates and for the CA. The directory run creates it and
-       puts this machine's computer account in it; the issuing run grants it Read and
-       Enroll on each template and writes its ACE on the CA. */
+    /* The group the connectors are in, and the one the CA names. The directory run
+       creates it and puts this machine's computer account in it; the issuing run
+       writes its ACE on the CA. It is not what the templates grant Enroll to. */
     enrollmentGroup: PKCS_CONNECTOR_GROUP,
+    /* Each selected template's own enrollment group, and the directory run nests the
+       group above into every one of them. Empty in the original retrofit and only
+       there: that mode writes no template and creates no group, so the CA's own
+       enrollment groups are the CA owner's to fill and this design has no business
+       putting anything inside them. */
+    templateGroups: scepNamesOnly() ? [] : pkcsTemplateEnrollmentGroups(),
     /* KB5014754 strong mapping. Written on the connector host, never here. */
     sidExtension: !!scep.pkcs.sidExtension,
     grantRevocation: !!scep.grantRevocation
@@ -26426,14 +26481,22 @@ function scepPreparesCa() { return scepStandalone() && !!state.adcs.scep.retrofi
    toggle, and the service account warning. One name, so there is not a fourth. */
 function scepNamesOnly() { return scepStandalone() && !scepPreparesCa(); }
 
-/* The enrollment groups the SCEP templates name, for the directory half to create.
-   Members are deliberately empty: the NDES account is put in by the SCEP directory
-   step, which is the one place that membership is decided. */
+/* The enrollment groups the connector's templates name, for the directory half to
+   create. Members are deliberately empty: the NDES account is put in by the SCEP
+   directory step and the connector group is nested by the PKCS one, which are the two
+   places those memberships are decided.
+
+   Mode-aware, and it was not: this read the SCEP slots whatever mode the retrofit was
+   in, so a `prepare` retrofit in PKCS mode created no enrollment group at all. That was
+   invisible while both PKCS templates named a role group the CA pass happened to create
+   anyway; the moment each template got its own group it became a template published with
+   an ACE naming a principal nothing makes. */
 function scepRetrofitEnrollmentGroups() {
   const seen = {};
   const groups = [];
-  const picked = scepSelectedTemplateIds();
-  scepSlotChoices().filter(function (entry) { return picked.indexOf(entry.id) !== -1; }).forEach(function (catalog) {
+  const picked = connectorForcedTemplateIds();
+  const choices = scepPkcsMode() ? pkcsTemplateChoices() : scepSlotChoices();
+  choices.filter(function (entry) { return picked.indexOf(entry.id) !== -1; }).forEach(function (catalog) {
     const item = state.adcs.issuing.templates.items.filter(function (i) { return i.id === catalog.id; })[0];
     if (!item) { return; }
     accessGrants(catalog.id).forEach(function (grant) {
@@ -27032,7 +27095,7 @@ function renderScepTemplateCard(template) {
               ? "The connector's computer account, and nothing else. Whatever the CA's own enrollment group is called, that machine has to be in it already."
               : "The NDES service account, and nothing else. Whatever the CA's own enrollment group is called, that account has to be in it already.")
           : (catalog.pkcsTemplate
-              ? "The connector's computer account, and nothing else. The directory run puts it in."
+              ? "This template's own group, holding the connector group and nothing else - the directory run creates both and nests one into the other. The computer account is a member of the inner one, never of this."
               : "The NDES service account, and nothing else. The directory run puts it in.") })
     ]) +
 
@@ -27319,9 +27382,14 @@ function renderConnectorPkcs() {
           : "A member server - never the issuing CA. Its <strong>computer account</strong> is the identity that enrolls." }) +
 
       factSection("pkcs-group-facts", [
-        factRow({ name: "The group", value: PKCS_CONNECTOR_GROUP,
-          why: "One group for both templates and for the CA, because every PKCS connector in a tenant has to hold identical permissions - a group per template would model a distinction that cannot exist. The computer account goes in it; nothing is ever granted to the machine directly." }),
-        factRow({ name: "On each template", value: "Read and Enroll",
+        factRow({ name: "The connector group", value: PKCS_CONNECTOR_GROUP,
+          why: "Where the computer accounts go, and the principal the CA names. One group and not one per connector, because every PKCS connector in a tenant has to hold identical permissions - a second connector is one group-add away from working. Nothing is ever granted to a machine directly." }),
+        factRow({ name: "Nested into", value: (function () {
+            const groups = pkcsTemplateEnrollmentGroups();
+            return groups.length ? groups.join(", ") : "each template's own enrollment group";
+          })(),
+          why: "Each PKCS template has its own <code>" + esc(state.adcs.access.prefix) + "&hellip;</code> group like every other template here, and the connector group is a member of it. The one-membership property survives - a connector in the group above reaches every template below - and withdrawing one template stays a change to one group." }),
+        factRow({ name: "On each template", value: "Read and Enroll, to that template's own group",
           why: "And Domain Users removed, which Microsoft's guide has as a numbered step. The enrollment ACL is the entire control on these templates - there is no policy module and no signed challenge behind a PKCS request." }),
         factRow({ name: "On the CA", value: "Request Certificates" + (scep.grantRevocation ? ", Issue and Manage Certificates" : ""),
           why: "Request Certificates is what lets the connector submit at all. It normally rides on Authenticated Users and goes unnoticed - but this design can take that default away itself, and a CA tightened that far refuses the connector with an access denied that names nothing. Issue and Manage is revocation, and only that." })
@@ -27984,12 +28052,13 @@ function renderPkcsRunbook() {
     badge: adcsAdoptMode() ? "Onto an adopted CA" : "With the PKI, or later",
     stops: [
       { icon: "active-directory.svg", where: "A domain controller",
-        what: "The directory run creates <code>" + esc(PKCS_CONNECTOR_GROUP) + "</code> and puts this connector's " +
-          "<strong>computer account</strong> in it. There is no service account in this mode - the connector runs as SYSTEM and " +
-          "reaches the CA as the machine." },
+        what: "The directory run creates <code>" + esc(PKCS_CONNECTOR_GROUP) + "</code>, puts this connector's " +
+          "<strong>computer account</strong> in it, and nests it into each template's own enrollment group. There is no service " +
+          "account in this mode - the connector runs as SYSTEM and reaches the CA as the machine." },
       { icon: "issuing-ca.svg", where: "The issuing CA",
-        what: "The normal run publishes the PKCS templates with Read and Enroll for that group, and writes the group's permissions " +
-          "on the CA itself - <em>Request Certificates</em>, and <em>Issue and Manage Certificates</em> when revocation is on." },
+        what: "The normal run publishes the PKCS templates with Read and Enroll for <em>their own</em> groups, and writes the " +
+          "connector group's permissions on the CA itself - <em>Request Certificates</em>, and <em>Issue and Manage Certificates</em> " +
+          "when revocation is on." },
       { icon: "cert-connector.svg", where: "This connector server",
         what: "The run <strong>installs nothing</strong>. It checks the prerequisites the connector has - Desktop Experience, " +
           ".NET, Enhanced Security Configuration off, and whether this server trusts the CA's chain at all - confirms the templates " +

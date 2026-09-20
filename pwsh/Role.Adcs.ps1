@@ -3051,7 +3051,13 @@ function Get-AdcsSeedMemberDn {
 }
 
 function Set-AdcsAccessGroup {
-    param([object]$Access)
+    param(
+        [object]$Access,
+        # Only to know which of the groups below this run fills by itself. Optional, so
+        # a caller that has no design in hand still gets the groups made - it just falls
+        # back to telling the reader to fill every empty one.
+        [object]$CertificateServices
+    )
 
     if ($null -eq $Access) { return }
     if (-not [bool](Get-ConfigValue -InputObject $Access -Name "createGroups" -Default $false)) {
@@ -3064,6 +3070,16 @@ function Set-AdcsAccessGroup {
 
     $container = [string](Get-ConfigValue -InputObject $Access -Name "organizationalUnit" -Default "")
     $scope     = [string](Get-ConfigValue -InputObject $Access -Name "scope" -Default "Global")
+
+    # The PKCS templates' groups are filled a moment later by Set-AdcsPkcsDirectory,
+    # which nests the connector group into each of them. Naming them in the 'fill these'
+    # list below would be this run telling somebody to do a job it is about to do, on the
+    # same screen, twenty lines apart.
+    $filledLater = @()
+    if (($null -ne $CertificateServices) -and ((Get-AdcsConnectorMode -CertificateServices $CertificateServices) -eq "pkcs")) {
+        $connector = Get-AdcsTierSection -CertificateServices $CertificateServices -TierName "scep"
+        if ($null -ne $connector) { $filledLater = @(Get-AdcsPkcsTemplateGroup -Connector $connector) }
+    }
 
     Write-Log "Making sure the $($groups.Count) enrollment group(s) this design maps exist" -Tag "Run"
     $created = @()
@@ -3093,8 +3109,9 @@ function Set-AdcsAccessGroup {
         $null = New-AdcsAccessGroup -Name $name -Scope $scope -ContainerDn $container -InitialMemberDn $seed `
             -Description ([string](Get-ConfigValue -InputObject $group -Name "description" -Default ""))
 
-        if ($seed.Count -eq 0) { $created += $name }
-        else { Write-Log "'$name' carries $($seedName -join ', ') when this run creates it" -Tag "Info" }
+        if ($seed.Count -gt 0) { Write-Log "'$name' carries $($seedName -join ', ') when this run creates it" -Tag "Info" }
+        elseif ($filledLater -contains $name) { Write-Log "'$name' is filled by the PKCS step below - the connector group goes in it" -Tag "Debug" }
+        else { $created += $name }
     }
 
     if ($created.Count -gt 0) {
@@ -4626,7 +4643,7 @@ function Set-AdcsCertificateTemplate {
 
     # Before the first ACE: an access rule naming a group that does not exist yet is
     # a template published with nobody able to enroll for it.
-    Set-AdcsAccessGroup -Access $access
+    Set-AdcsAccessGroup -Access $access -CertificateServices $CertificateServices
 
     $configurationNamingContext = Get-AdcsConfigurationNamingContext
     Write-Log "Writing templates into $configurationNamingContext" -Tag "Get"
@@ -6212,7 +6229,7 @@ function Invoke-AdcsDirectoryTier {
         Write-Log "Connector retrofit: the service account, its enrollment group and the certificate managers group" -Tag "Info"
 
         $rolesApplied = Set-AdcsRoleGroup -CertificateServices $CertificateServices
-        Set-AdcsAccessGroup -Access $access
+        Set-AdcsAccessGroup -Access $access -CertificateServices $CertificateServices
         $scepApplied  = Set-AdcsScepDirectory -CertificateServices $CertificateServices
         # The CA in this mode is somebody else's and its publication alias is left to
         # them - but the SCEP endpoint's name is this design's own, and a connector
@@ -6232,7 +6249,7 @@ function Invoke-AdcsDirectoryTier {
     Write-Log "Preparing the directory and DNS for this PKI - no CA is installed here" -Tag "Info"
 
     $rolesApplied  = Set-AdcsRoleGroup -CertificateServices $CertificateServices
-    Set-AdcsAccessGroup -Access $access
+    Set-AdcsAccessGroup -Access $access -CertificateServices $CertificateServices
     $scepApplied   = Set-AdcsScepDirectory -CertificateServices $CertificateServices
     $aliasApplied  = Set-AdcsPublicationAlias -CertificateServices $CertificateServices
     # The SCEP endpoint's public name, made to answer indoors as well - the same split
