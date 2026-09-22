@@ -2305,7 +2305,13 @@ const TEMPLATE_CATALOG = [
     note: "Client Authentication is dropped and replaced with the <strong>Remote Desktop Authentication</strong> EKU (<code>1.3.6.1.4.1.311.54.1.2</code>) - a certificate that only does RDP host identity and cannot be used to authenticate <em>as</em> anything. Publishing it is not enough on its own: Group Policy has to point RDP at it under <em>Remote Desktop Session Host &gt; Security &gt; Server authentication certificate template</em>, using the template <strong>name</strong>, not its display name.",
     fixedPrincipals: [],
     suggestedGroup: {
-      mode: "autoenroll",
+      /* Enroll, not autoenroll: the RDP listener does not pick this certificate up
+         through autoenrollment. The *Server authentication certificate template*
+         policy names the template and the host enrolls for it on that policy's
+         behalf, which needs Enroll and nothing more. An autoenroll ACE on top would
+         hand every member of the group a second copy of the same certificate by a
+         path nobody asked for. */
+      mode: "enroll",
       description: "Hosts that present a managed certificate for Remote Desktop",
       /* The one enrollment group this design seeds, and only when the run creates it.
          Every machine that answers RDP wants this certificate - that is the whole point
@@ -20374,8 +20380,8 @@ function renderRdsCertificateCard() {
       infoBox("The RDP listener's certificate is Group Policy's job, not this run's. The Certificate Services design creates the " +
         "<em>Certificate - Remote Desktop Authentication</em> policy objects - they point every session host at the " +
         "<strong>Remote Desktop Authentication</strong> template (<em>Remote Desktop Session Host &gt; Security &gt; Server " +
-        "authentication certificate template</em>) and autoenrollment keeps the certificate renewed with no per-server step to " +
-        "forget. Link the member-server object to the OU holding this host, put the host in the " +
+        "authentication certificate template</em>) and the host re-enrolls off that policy when the certificate expires, with no " +
+        "per-server step to forget. Link the member-server object to the OU holding this host, put the host in the " +
         "<code>Certificate - Remote Desktop Authentication</code> enrollment group, and the listener leaves its self-signed " +
         "certificate on the next policy refresh."), "security.svg", "", { defaultOpen: false }) +
 
