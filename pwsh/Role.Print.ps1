@@ -816,8 +816,8 @@ function Test-PrintPrerequisite {
 
     # Every queue has to name a port and a driver the design also describes, or the apply
     # path fails one queue at a time with an error naming neither the design nor the gap.
-    $portNames   = @(Get-PrintPortDefinition -PrintServer $printServer | ForEach-Object { $_.Name })
-    $driverNames = @(Get-PrintDriverDefinition -PrintServer $printServer | ForEach-Object { $_.Name })
+    $portNames   = @((Get-PrintPortDefinition -PrintServer $printServer) | ForEach-Object { $_.Name })
+    $driverNames = @((Get-PrintDriverDefinition -PrintServer $printServer) | ForEach-Object { $_.Name })
 
     foreach ($queue in (Get-PrintQueue -PrintServer $printServer)) {
         if ([string]::IsNullOrWhiteSpace($queue.Port) -or ($portNames -notcontains $queue.Port)) {

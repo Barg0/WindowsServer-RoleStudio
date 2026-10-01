@@ -524,12 +524,17 @@ function Invoke-FsClusterConfiguration {
         }
 
         if ($toBuild.Count -gt 0) {
-            $candidates = @(Get-StudioClusterSharedDiskCandidate |
+            # The parentheses are the fix, not style. The candidate function returns
+            # ,$found - ONE object, the array - and piped bare, Where-Object saw that array
+            # as a single $_, passed it whole, and the count was 1 however many raw disks
+            # there were (bench, 2026-10-01: two raw 100 GB disks, "1 raw unclaimed disk").
+            $candidates = @((Get-StudioClusterSharedDiskCandidate) |
                     Where-Object { $_.PartitionStyle -eq "RAW" } | Sort-Object -Property Size -Descending)
             if ($candidates.Count -lt $toBuild.Count) {
                 Write-Log ("{0} raw unclaimed disk(s) visible and this design needs {1} - they have to be presented to both guests first" -f $candidates.Count, $toBuild.Count) -Tag "Error"
                 Write-Log "    On Hyper-V that is a VHD Set (.vhds) on a SCSI controller in both VMs, or a LUN masked to both" -Tag "Error"
                 Write-Log "    One disk per volume: the data shares and the profile containers are separate volumes by design" -Tag "Error"
+                Write-StudioClusterDiskInventory
                 $failures += "shared disk"
             }
             else {

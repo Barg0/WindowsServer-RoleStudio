@@ -466,6 +466,55 @@ function Get-StudioClusterSharedDiskCandidate {
     return ,$found
 }
 
+# Why the count came up short, disk by disk. "1 raw disk visible, 2 needed" is true and
+# answers nothing when the operator attached two: the second one is nearly always THERE,
+# just not raw - initialised by the prompt Disk Management raises the first time it is
+# opened, left GPT by an earlier run, already claimed by the cluster - or attached to the
+# other guest only. Each of those is a different fix, so every non-boot disk is named
+# with the reason it was passed over. Nothing here changes a disk.
+function Write-StudioClusterDiskInventory {
+    try { $disks = @(Get-Disk -ErrorAction Stop | Sort-Object -Property Number) }
+    catch {
+        Write-Log "    Get-Disk failed, so the disks cannot be listed: $($_.Exception.Message)" -Tag "Error"
+        return
+    }
+
+    $listed = 0
+    foreach ($disk in $disks) {
+        if ($disk.IsBoot -or $disk.IsSystem) { continue }
+        $listed++
+        $state = @()
+        if ($disk.IsOffline) { $state += "offline" }
+        if ($disk.IsReadOnly) { $state += "read-only" }
+        $head = ("    Disk {0}: {1} GB, {2}, bus {3}{4}" -f $disk.Number, [math]::Round($disk.Size / 1GB),
+            [string]$disk.PartitionStyle, [string]$disk.BusType,
+            $(if ($state.Count -gt 0) { ", " + ($state -join ", ") } else { "" }))
+
+        if ($disk.IsClustered) {
+            Write-Log "$head - already cluster storage, not a candidate" -Tag "Info"
+        }
+        elseif ([string]$disk.PartitionStyle -eq "RAW") {
+            Write-Log "$head - raw, a candidate" -Tag "Info"
+        }
+        else {
+            $data = @()
+            try { $data = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop | Where-Object { [string]$_.Type -ne "Reserved" }) }
+            catch { $data = @() }
+            if ($data.Count -eq 0) {
+                Write-Log "$head - initialised but holds no data partition, so it is not raw and is left alone" -Tag "Info"
+                Write-Log ("        If that disk is the empty shared disk, make it raw again by hand: Clear-Disk -Number {0} -RemoveData -RemoveOEM" -f $disk.Number) -Tag "Info"
+            }
+            else {
+                Write-Log ("$head - carries {0} partition(s), treated as somebody's data" -f $data.Count) -Tag "Info"
+            }
+        }
+    }
+
+    if ($listed -eq 0) {
+        Write-Log "    No disk besides the system disk is visible on this node - the shared disks are not attached to this guest" -Tag "Info"
+    }
+}
+
 # The volume flag continuous availability cares about, read back rather than assumed.
 # **Returns $true when short name creation is OFF** - the state a continuously available
 # share needs - $false when it is on, and $null when the answer could not be read: fsutil

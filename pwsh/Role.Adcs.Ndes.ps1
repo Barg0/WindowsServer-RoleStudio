@@ -2842,7 +2842,7 @@ function Test-AdcsScepEndpoint {
             # certificate store and the other in a token that has not been refreshed.
             Write-Log "NDES answers 500 - it is running and cannot serve. Two causes, in this order:" -Tag "Error"
 
-            $missing = @(Get-AdcsScepCertificateHealth | Where-Object { $_.Grade -eq "Missing" -and $_.Label -like "NDES registration authority*" })
+            $missing = @((Get-AdcsScepCertificateHealth) | Where-Object { $_.Grade -eq "Missing" -and $_.Label -like "NDES registration authority*" })
             if ($missing.Count -gt 0) {
                 # The configuration writes the MSCEP key and then enrolls; a run that got
                 # the first half and not the second leaves a server that answers
@@ -3141,7 +3141,7 @@ function Invoke-AdcsScepTier {
     # nothing - and from then on every run reads the key, says "already configured" and
     # reconciles settings around an NDES that answers 500 to everything. Field-hit
     # 2026-08-16: the key was there, both registration authority certificates were not.
-    $missingRa = @(Get-AdcsScepCertificateHealth |
+    $missingRa = @((Get-AdcsScepCertificateHealth) |
         Where-Object { $_.Grade -eq "Missing" -and $_.Label -like "NDES registration authority*" })
     if ($missingRa.Count -gt 0) {
         Write-Log "NDES is configured but holds none of its registration authority certificates: $(($missingRa | ForEach-Object { $_.Label }) -join ', ')" -Tag "Error"
