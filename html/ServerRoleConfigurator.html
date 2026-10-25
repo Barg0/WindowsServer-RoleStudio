@@ -452,9 +452,13 @@
     padding: 7px 12px; border-radius: var(--radius); cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
   }
   .btn:hover { background: var(--bg-hover); }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-  .btn.primary:hover { background: var(--accent-hover); box-shadow: var(--shadow-2); }
-  .btn.danger { border-color: var(--danger); color: var(--danger-fg); background: var(--danger); }
+  /* No solid buttons: the main action is the accent as border and text on a faint accent
+     wash - the same box as every button beside it, still the one found first. A
+     destructive confirm does the same in the danger red. Taken from the sibling kiln studio. */
+  .btn.primary { background: color-mix(in srgb, var(--accent) 7%, var(--bg-subtle)); border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); color: var(--accent); font-weight: 600; }
+  .btn.primary:hover { background: color-mix(in srgb, var(--accent) 14%, var(--bg-subtle)); border-color: var(--accent); }
+  .btn.danger { background: color-mix(in srgb, var(--danger) 7%, var(--bg-subtle)); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); color: var(--danger-text); font-weight: 600; }
+  .btn.danger:hover { background: color-mix(in srgb, var(--danger) 14%, var(--bg-subtle)); border-color: var(--danger); }
   .btn.danger-text { background: transparent; border-color: transparent; color: var(--danger); }
   .btn.danger-text:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
   .btn.ghost { background: transparent; border-color: transparent; }
@@ -474,9 +478,14 @@
   .card-head .btn { min-height: 0; }
   :is(.card-body, .section, .disclosure-body, .tpl-body) .btn.icon { min-height: 0; }
   .btn:disabled { opacity: .45; cursor: not-allowed; }
+  /* Hover must not light a disabled button back up, whatever variant it is. */
+  .btn:disabled:hover { background: var(--bg-subtle); box-shadow: none; }
+  .btn.primary:disabled:hover { background: color-mix(in srgb, var(--accent) 7%, var(--bg-subtle)); border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); }
+  .btn.danger:disabled:hover { background: color-mix(in srgb, var(--danger) 7%, var(--bg-subtle)); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
+  .btn.ghost:disabled:hover, .btn.danger-text:disabled:hover { background: transparent; }
   /* Three treatments, and the difference between them is the information: the two
      ghosts are things you might do, the appearance button is a state you are in, and
-     the one filled button is what this whole studio is for. A bar of five identical
+     the one accent button is what this whole studio is for. A bar of five identical
      ghosts said none of that - which is what the blue plate used to hide. */
   .topbar .btn { height: 32px; }
   .topbar .btn.ghost { color: var(--fg-muted); }
@@ -488,7 +497,7 @@
     padding: 0 12px 0 6px; gap: 8px; margin-right: 8px;
   }
   .topbar #themeBtn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
-  .topbar .btn.primary { height: 32px; font-weight: 700; margin-left: 6px; border-color: var(--accent); }
+  .topbar .btn.primary { height: 32px; font-weight: 700; margin-left: 6px; }
   .btn.row {
     width: 100%; height: auto; min-height: 30px; justify-content: flex-start; text-align: left;
     background: transparent; border: none; border-radius: var(--radius); padding: 6px 8px;
@@ -2073,18 +2082,6 @@ function tintIcon(name, theme) {
   return (_iconCache[key] = "data:image/svg+xml," + encodeURIComponent(svg));
 }
 
-/* For a glyph sitting ON the accent (the primary button): flatten to accentFg so it
-   reads as a single-colour mark rather than a two-tone one on a saturated field. */
-function tintIconOnAccent(name, theme) {
-  const resolved = ICON_TEMPLATES[name] ? name : (ICON_ALIASES[name] || "servers.svg");
-  const def = ICON_TEMPLATES[resolved];
-  const key = theme.id + "|onaccent|" + resolved;
-  if (_iconCache[key]) { return _iconCache[key]; }
-  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18">' +
-    def.markup.split("@H").join(theme.accentFg).split("@S").join(theme.accentFg) + "</svg>";
-  return (_iconCache[key] = "data:image/svg+xml," + encodeURIComponent(svg));
-}
-
 /* Dev aid: returns every key referenced nowhere, and every reference with no key.
    Run it once after repointing call sites. */
 function auditIcons(referencedNames) {
@@ -3388,12 +3385,11 @@ function icon(name, size) {
   return '<img src="' + iconSrc(name || "help.svg") + '" data-icon-name="' + esc(name || "help.svg") +
     '" width="' + px + '" height="' + px + '" alt="">';
 }
-/* For a glyph on the accent - the primary buttons. Two-tone artwork on a saturated
-   field reads as a smudge; flattened to accentFg it stays a mark. */
+/* The primary buttons' glyph. Kept as its own name for the call sites: the button is a
+   faint wash now, not a solid accent field, so the two-tone mark reads as it does
+   anywhere else and there is nothing left to flatten. */
 function iconOnAccent(name, size) {
-  const px = size || 16;
-  return '<img src="' + tintIconOnAccent(name || "help.svg", currentTheme()) + '" data-icon-name="' + esc(name || "help.svg") +
-    '" data-icon-accent="1" width="' + px + '" height="' + px + '" alt="">';
+  return icon(name, size);
 }
 /* The top bar and the modals are static markup hydrated once, so they are the only
    icons on the page a re-render does not reach. Re-tinting by attribute catches them
@@ -3401,7 +3397,7 @@ function iconOnAccent(name, size) {
 function retintIcons(theme) {
   document.querySelectorAll("img[data-icon-name]").forEach(function (img) {
     const name = img.dataset.iconName;
-    img.src = img.dataset.iconAccent ? tintIconOnAccent(name, theme) : tintIcon(name, theme);
+    img.src = tintIcon(name, theme);
   });
 }
 function uid(prefix) {
