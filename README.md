@@ -164,11 +164,11 @@ the top of that role's page in the studio.
 ### Azure Arc for a whole fleet
 <div align="justify">
 
-`scripts\arc\deploy\Connect-ArcServer.ps1` is separate from the studio: one file you fill in once
+[`scripts\arc\deploy\Connect-ArcServer.ps1`](scripts/arc/deploy/README.md) is separate from the studio: one file you fill in once
 and put into a GPO. A scheduled task runs it every hour as SYSTEM on every server the GPO reaches -
 it installs the agent if it is missing, connects the server, checks five things that prove it works,
-and mails you only when something changes. The GPO setup is in its help:
-`Get-Help .\Connect-ArcServer.ps1 -Full`. Try `-TestMail` first to see the five mails.
+and mails you only when something changes. The Azure setup, the GPO and
+what each mail means are in [its own README](scripts/arc/deploy/README.md).
 
 </div>
 

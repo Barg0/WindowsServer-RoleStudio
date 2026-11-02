@@ -123,7 +123,9 @@
     SMTP port of the relay.
 
 .PARAMETER MailUseSsl
-    Use STARTTLS towards the relay.
+    STARTTLS towards the relay - usually port 587. A bool rather than a switch so it can
+    be set in the default like everything else. SmtpClient cannot speak implicit TLS, so
+    port 465 does not work with either value.
 
 .PARAMETER MailFrom
     Sender address.
@@ -175,7 +177,7 @@ param(
     # ---------------------------[ Mail ]---------------------------
     [string]$MailSmartHost       = "",
     [int]$MailPort               = 25,
-    [switch]$MailUseSsl,
+    [bool]$MailUseSsl            = $false,
     [string]$MailFrom            = "",
     [string]$MailFromDisplayName = "Azure Arc Onboarding",
     [string[]]$MailTo            = @(),
@@ -1939,7 +1941,7 @@ function Send-ArcMail {
         [System.Net.ServicePointManager]::SecurityProtocol =
             [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
         $client = New-Object System.Net.Mail.SmtpClient($MailSmartHost, $MailPort)
-        $client.EnableSsl = [bool]$MailUseSsl
+        $client.EnableSsl = $MailUseSsl
         $client.Timeout   = 30000
         $client.Send($message)
         Write-Log "Mail '$Subject' -> $($MailTo -join ', ') via ${MailSmartHost}:$MailPort" -Tag "Ok"
