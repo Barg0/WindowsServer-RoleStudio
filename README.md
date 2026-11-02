@@ -113,7 +113,7 @@ knowing before you run it anywhere else:
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/overview-dark.png"><img src=".github/assets/icons/overview-light.png" width="16" alt=""></picture> html\ServerRoleConfigurator.html   the studio, one self-contained file
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/powershell-dark.png"><img src=".github/assets/icons/powershell-light.png" width="16" alt=""></picture> Configure-ServerRoles.ps1          the script you run
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> pwsh\                             one file per role, loaded by the script
-├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> scripts\                          standalone tools, run by hand
+├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/files-dark.png"><img src=".github/assets/icons/files-light.png" width="16" alt=""></picture> scripts\                          standalone tools, e.g. Arc onboarding by GPO
 ├─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/install-media-dark.png"><img src=".github/assets/icons/install-media-light.png" width="16" alt=""></picture> isos\                             installation media, never committed
 └─ <picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/icons/settings-dark.png"><img src=".github/assets/icons/settings-light.png" width="16" alt=""></picture> logs\                             one log per run, timestamped
 </pre>
@@ -158,6 +158,17 @@ Get-ChildItem -Path C:\role-adcs -Recurse | Unblock-File
 
 Which machine to start with, and what happens on each one, is on the **How to run this** card at
 the top of that role's page in the studio.
+
+</div>
+
+### Azure Arc for a whole fleet
+<div align="justify">
+
+`scripts\arc\deploy\Connect-ArcServer.ps1` is separate from the studio: one file you fill in once
+and put into a GPO. A scheduled task runs it every hour as SYSTEM on every server the GPO reaches -
+it installs the agent if it is missing, connects the server, checks five things that prove it works,
+and mails you only when something changes. The GPO setup is in its help:
+`Get-Help .\Connect-ArcServer.ps1 -Full`. Try `-TestMail` first to see the five mails.
 
 </div>
 
